@@ -1,6 +1,6 @@
 # Learning Battery Market - API Reference
 
-**Version**: 0.4.1
+**Version**: 0.5.0
 
 ## Overview
 
@@ -139,8 +139,17 @@ Get a group's chain snapshot. Requires group membership.
       "name": "My Group",
       "members": { "pub_key": "admin", ... },
       "balances": { "pub_key": 1000, ... },
+      "total_supply": 10000,
       "offers": { ... },
-      "policy": { ... }
+      "policy": {
+        "name": "My Group",
+        "currency": "KAT",
+        "faucet_amount": 100,
+        "claim_reward_amount": 10,
+        "transfer_fee_bps": 250,
+        "max_total_supply": 1000000,
+        "max_account_balance": 10000
+      }
     }
   }
 }
@@ -472,6 +481,7 @@ Extended health check with per-group chain status. Used by sync daemon.
 | `offer_deactivate` | Deactivate offer | `offer_id`, `ts_ms` |
 | `purchase` | Purchase offer | `offer_id`, `buyer`, `amount`, `nonce`, `ts_ms`, `sig` |
 | `grant` | Grant access | `offer_id`, `buyer`, `package_hash`, `sealed_key`, `ts_ms` |
+| `policy_update` | Update group policy | `updates` (dict), `ts_ms` |
 
 ---
 
@@ -591,6 +601,7 @@ lb buy-offer --data ./mynode --offer OID --host 192.168.1.100 --port 7337 --prin
 
 | Version | Changes |
 |---------|---------|
+| 0.5.0 | Token economy: member faucet, claim rewards, transfer fees, supply caps, `policy_update` transaction |
 | 0.4.1 | Security fixes: CORS subdomain spoofing, connection race condition, sync daemon retry backoff |
 | 0.4.0 | Auto-sync daemon, peer registry, subscription management, group discovery (`group_list_available`, `peer_exchange`, `sync_status`) |
 | 0.3.0 | Security hardening: memory-bounded rate limiting, network timeouts, block timestamp validation |

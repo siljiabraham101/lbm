@@ -13,11 +13,19 @@ Per-group permissioned chain of signed blocks (proof-of-authority).
 Tx types:
 - genesis
 - member_add / member_remove
-- mint
+- mint / transfer
+- policy_update
 - claim / retract
 - offer_create / offer_revoke
 - purchase
 - grant
+
+### 2.5) Token Economy
+Configurable per-group token distribution:
+- Member faucet (auto-mint on join)
+- Claim rewards (tokens for knowledge)
+- Transfer fees (basis points to treasury)
+- Supply caps (total and per-account)
 
 ### 3) Context graph
 Truth-maintenance flavored:

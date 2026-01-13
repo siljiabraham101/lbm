@@ -157,6 +157,36 @@ All user inputs are validated:
 | Group name | 128 chars | Alphanumeric + colons/dashes/underscores |
 | Nonce | 32+ chars | Hex characters |
 
+## Token Economy Security
+
+The token economy includes multiple security measures:
+
+### Integer Overflow Protection
+
+- MAX_TOKEN_VALUE = 2^63 - 1 (safe int64 limit)
+- All token operations check for overflow
+- Transfer amount + fee overflow check
+
+### Policy Update Validation
+
+- Only admins can update policy
+- Empty updates rejected
+- Unknown policy keys rejected
+- Fee bounds enforced (0-5000 bps = 0-50%)
+- Supply cap cannot be lowered below current supply
+
+### Faucet and Rewards
+
+- Faucet only for genuinely new members (not duplicates)
+- Rewards and faucet respect supply caps
+- Account balance caps enforced
+
+### Transfer Fees
+
+- Fee capped at 50% (5000 basis points)
+- Sender must have balance >= amount + fee
+- Fees sent to treasury account
+
 ## Fork Resolution
 
 Deterministic fork resolution prevents chain divergence:

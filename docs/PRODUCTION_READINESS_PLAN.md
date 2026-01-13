@@ -6,7 +6,7 @@ The Learning Battery Market codebase is **production-ready** with comprehensive 
 
 **Status: 98% Complete (44/45 issues resolved)**
 
-**Version: 0.4.1**
+**Version: 0.5.0**
 
 ## Implementation Status
 
@@ -113,6 +113,19 @@ The Learning Battery Market codebase is **production-ready** with comprehensive 
 | 6.4 Thread-Safe Registry | DONE | Double-checked locking in `lb/node.py` |
 | 6.5 MCP Import | DONE | Proper static import in `lb/mcp.py` |
 
+## Phase 7: v0.5.0 Token Economy - COMPLETED
+
+| Issue | Status | Implementation |
+|-------|--------|----------------|
+| 7.1 Member Faucet | DONE | Auto-mint tokens to new members in `lb/chain.py` |
+| 7.2 Claim Rewards | DONE | Block author receives tokens for claims |
+| 7.3 Transfer Fees | DONE | Basis point fees to treasury |
+| 7.4 Supply Caps | DONE | `max_total_supply` and `max_account_balance` enforcement |
+| 7.5 Total Supply Tracking | DONE | `total_supply` in GroupState |
+| 7.6 Policy Update TX | DONE | Admin-only `policy_update` transaction type |
+| 7.7 Overflow Protection | DONE | MAX_TOKEN_VALUE = 2^63 - 1 |
+| 7.8 Node API Methods | DONE | `update_group_policy()`, `get_token_stats()`, `transfer()` |
+
 ---
 
 ## Remaining Items
@@ -177,7 +190,7 @@ export LB_P2P_MAX_REQ_PER_MIN=60
 ## Testing Summary
 
 ### Completed
-- [x] Unit tests for all security features (52 tests passing)
+- [x] Unit tests for all security features (102 tests passing)
 - [x] Key encryption roundtrip tests
 - [x] Rate limiting boundary tests
 - [x] CAS thread safety tests
@@ -186,6 +199,7 @@ export LB_P2P_MAX_REQ_PER_MIN=60
 - [x] Sync daemon tests (16 tests)
 - [x] Admin panel tests (9 tests)
 - [x] Thread safety tests for peer registry
+- [x] Token economy tests (33 tests)
 
 ### Verification Commands
 
@@ -201,6 +215,9 @@ python -m pytest tests/test_sync.py -v
 
 # Run admin panel tests
 python -m pytest tests/test_admin.py -v
+
+# Run token economy tests
+python -m pytest tests/test_token_economy.py -v
 
 # Verify imports
 python -c "from lb.node import BatteryNode; from lb.admin import AdminServer; from lb.sync_daemon import SyncDaemon"
@@ -221,7 +238,8 @@ The codebase has achieved **98% production readiness** (44/45 issues resolved).
 - Structured logging for operations
 - Web admin panel with secure CORS policy
 - Auto-sync daemon with retry backoff
-- 52 comprehensive tests passing
+- Token economy with faucet, rewards, fees, and supply caps
+- 102 comprehensive tests passing
 
 **Deferred:**
 - HTLC for atomic purchases (requires protocol redesign)

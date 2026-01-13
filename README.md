@@ -24,6 +24,7 @@ No central server. No cloud dependencies. Just secure peer-to-peer knowledge exc
 | **Rate limiting** | Per-IP connection limits and per-peer request limits |
 | **Replay protection** | Cryptographic nonces with 24-hour expiration |
 | **Fork resolution** | Deterministic chain fork handling |
+| **Token economy** | Member faucet, claim rewards, transfer fees, supply caps |
 | **Input validation** | Configurable size limits on all inputs |
 | **Structured logging** | JSON logging with rotation for production |
 
@@ -174,6 +175,52 @@ lb list-offers --data ./nodeB
 # Purchase and decrypt
 lb buy-offer --data ./nodeB --offer <OFFER_ID> \
   --host <SELLER_IP> --port 7337 --print
+```
+
+## Token Economy
+
+Groups can configure automatic token distribution with rewards and fees.
+
+### Policy Configuration
+
+```bash
+# Configure token economy (admin only)
+# - faucet_amount: Tokens given to new members
+# - claim_reward_amount: Tokens earned per knowledge claim
+# - transfer_fee_bps: Fee in basis points (100 = 1%)
+# - max_total_supply: Cap on total token circulation
+# - max_account_balance: Cap on individual accounts
+```
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Member Faucet** | Auto-mint tokens when new members join |
+| **Claim Rewards** | Earn tokens for publishing knowledge claims |
+| **Transfer Fees** | Percentage-based fees sent to treasury |
+| **Supply Caps** | Limit total and per-account token balances |
+
+### Programmatic API
+
+```python
+from lb.node import BatteryNode
+
+node = BatteryNode.load(Path("./mynode"))
+
+# Update policy (admin only)
+node.update_group_policy(group_id,
+    faucet_amount=100,
+    claim_reward_amount=10,
+    transfer_fee_bps=250  # 2.5% fee
+)
+
+# Get token stats
+stats = node.get_token_stats(group_id)
+print(f"Total supply: {stats['total_supply']}")
+
+# Transfer tokens
+node.transfer(group_id, to_pub="...", amount=100)
 ```
 
 ## Web Admin Panel
