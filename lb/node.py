@@ -196,7 +196,22 @@ class BatteryNode:
         return node
 
     @staticmethod
-    def load(data_dir: Path) -> "BatteryNode":
+    def load(data_dir: Path, *, password: Optional[str] = None) -> "BatteryNode":
+        """Load a BatteryNode from a data directory.
+
+        Args:
+            data_dir: Path to the node data directory
+            password: Password for encrypted keys. If keys are encrypted and
+                     password is not provided, will prompt interactively.
+
+        Returns:
+            Loaded BatteryNode instance
+
+        Raises:
+            NodeError: If node is not initialized or key files are missing
+        """
+        from .key_encryption import is_encrypted_key_file, load_keys, KeyEncryptionError
+
         data_dir = Path(data_dir)
         meta_path = data_dir / "node.json"
         if not meta_path.exists():
@@ -205,14 +220,26 @@ class BatteryNode:
         enc_path = data_dir / "keys" / "encryption.key"
         if not sign_path.exists() or not enc_path.exists():
             raise NodeError("missing key files")
-        sign_priv = load_sign_priv_raw(sign_path.read_bytes())
-        enc_priv = load_enc_priv_raw(enc_path.read_bytes())
-        keys = NodeKeys(
-            sign_priv=sign_priv,
-            sign_pub=sign_priv.public_key(),
-            enc_priv=enc_priv,
-            enc_pub=enc_priv.public_key(),
-        )
+
+        # Check if keys are encrypted
+        if is_encrypted_key_file(sign_path) or is_encrypted_key_file(enc_path):
+            if password is None:
+                import getpass
+                password = getpass.getpass("Enter key password: ")
+            try:
+                keys = load_keys(data_dir, password)
+            except KeyEncryptionError as e:
+                raise NodeError(f"failed to load encrypted keys: {e}") from e
+        else:
+            # Load unencrypted keys
+            sign_priv = load_sign_priv_raw(sign_path.read_bytes())
+            enc_priv = load_enc_priv_raw(enc_path.read_bytes())
+            keys = NodeKeys(
+                sign_priv=sign_priv,
+                sign_pub=sign_priv.public_key(),
+                enc_priv=enc_priv,
+                enc_pub=enc_priv.public_key(),
+            )
         return BatteryNode(data_dir, keys)
 
     # ---------- loading state ----------
@@ -343,48 +370,73 @@ class BatteryNode:
             "max_account_balance": state.policy.max_account_balance,
         }
 
-    def transfer(self, group_id: str, to_pub: str, amount: int) -> None:
+    def transfer(self, group_id: str, to_pub: str, amount: int, *,
+                 signer_keys: Optional[NodeKeys] = None) -> None:
         """Transfer tokens to another member.
 
         Args:
             group_id: Group where transfer occurs
             to_pub: Recipient's public key
             amount: Amount to transfer (must be > 0)
+            signer_keys: Optional keys to sign with (for multi-agent scenarios).
+                        The transfer will be from this key's identity.
 
         Note: Sender pays transfer fee if configured. Fee goes to treasury.
         """
         with self._lock:
             g = self._require_group(group_id)
+            keys = signer_keys or self.keys
             tx = {
                 "type": "transfer",
-                "from": self.keys.sign_pub_b64,
+                "from": keys.sign_pub_b64,
                 "to": to_pub,
                 "amount": int(amount),
                 "ts_ms": _now_ms(),
             }
-            self._append_block(g, [tx])
+            self._append_block(g, [tx], signer_keys=signer_keys)
             logger.debug(f"Transferred {amount} tokens to {to_pub[:16]}... in group {group_id}")
 
     # ---------- claims / context ----------
 
-    def publish_claim(self, group_id: str, text: str, tags: List[str]) -> str:
+    def publish_claim(
+        self, group_id: str, text: str, tags: List[str], *, parent_hash: Optional[str] = None,
+        signer_keys: Optional[NodeKeys] = None
+    ) -> str:
+        """Publish a knowledge claim to a group.
+
+        Args:
+            group_id: Group to publish to
+            text: Claim text content
+            tags: List of tags for categorization
+            parent_hash: Optional parent claim hash for threading/replies
+            signer_keys: Optional keys to sign with (for multi-agent scenarios)
+
+        Returns:
+            Claim hash (content-addressed identifier)
+        """
         # Validate inputs
         text = validate_claim_text(text)
         tags = validate_tags(tags)
 
         with self._lock:
             g = self._require_group(group_id)
+            # Validate parent_hash if provided
+            if parent_hash is not None:
+                if parent_hash not in g.graph.claims:
+                    raise NodeError(f"parent claim {parent_hash} not found")
             # store claim artifact
-            claim_obj = {"v": 1, "text": text, "tags": tags, "created_ms": _now_ms()}
+            claim_obj = {"v": 2, "text": text, "tags": tags, "created_ms": _now_ms()}
+            if parent_hash is not None:
+                claim_obj["parent_hash"] = parent_hash
             h = self.cas.put_json(claim_obj, CasMeta(visibility=f"group:{group_id}", kind="claim", group_id=group_id))
             # chain tx
             tx = {"type": "claim", "artifact_hash": h, "ts_ms": _now_ms()}
-            self._append_block(g, [tx])
+            self._append_block(g, [tx], signer_keys=signer_keys)
             # update graph
-            g.graph.add_claim(h, text=text, tags=tags, evidence=[])
+            g.graph.add_claim(h, text=text, tags=tags, evidence=[], parent_hash=parent_hash)
             g.save()
-            self.log_event("claim", {"group_id": group_id, "claim_hash": h})
-            logger.debug(f"Published claim: hash={h[:16]}..., group={group_id}")
+            self.log_event("claim", {"group_id": group_id, "claim_hash": h, "parent_hash": parent_hash})
+            logger.debug(f"Published claim: hash={h[:16]}..., group={group_id}, parent={parent_hash}")
             return h
 
     def submit_experience(self, group_id: str, experience: Dict[str, Any]) -> str:
@@ -421,6 +473,7 @@ class BatteryNode:
                                     tags=list(obj.get("tags", [])),
                                     evidence=list(obj.get("evidence", [])),
                                     created_ms=int(obj.get("created_ms", 0) or 0),
+                                    parent_hash=obj.get("parent_hash"),
                                 )
                             except Exception as e:
                                 logger.warning(f"Failed to rebuild claim {h[:16]}...: {type(e).__name__}: {e}")
@@ -633,10 +686,242 @@ class BatteryNode:
             g.save()
             self.log_event("retract", {"group_id": group_id, "claim_hash": claim_hash})
 
-    def compile_context(self, group_id: str, query: str, *, top_k: int = 8) -> Tuple[str, List[str]]:
+    def compile_context(
+        self, group_id: str, query: str, *, top_k: int = 8, since_ms: Optional[int] = None
+    ) -> Tuple[str, List[str]]:
+        """Compile context from claims using similarity ranking.
+
+        Args:
+            group_id: Group to query
+            query: Search query for similarity ranking
+            top_k: Number of results to return
+            since_ms: Only include claims created after this timestamp (optional)
+
+        Returns:
+            Tuple of (formatted context string, list of claim hashes)
+        """
         g = self._require_group(group_id)
-        slice_text, chosen = g.graph.compile(query, top_k=top_k)
+        slice_text, chosen = g.graph.compile(query, top_k=top_k, since_ms=since_ms)
         return slice_text, chosen
+
+    def get_recent_claims(
+        self, group_id: str, since_ms: int, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Get claims created after a timestamp.
+
+        Args:
+            group_id: Group to query
+            since_ms: Only return claims created after this timestamp
+            limit: Maximum number of claims to return
+
+        Returns:
+            List of claim dicts sorted by created_ms descending
+        """
+        g = self._require_group(group_id)
+        claims = []
+        for h, c in g.graph.claims.items():
+            if not c.retracted and c.created_ms >= since_ms:
+                claims.append({
+                    "claim_hash": h,
+                    "text": c.text,
+                    "tags": list(c.tags),
+                    "created_ms": c.created_ms,
+                    "parent_hash": c.parent_hash,
+                })
+        # Sort by timestamp descending
+        claims.sort(key=lambda x: x["created_ms"], reverse=True)
+        return claims[:limit]
+
+    # ---------- task management ----------
+
+    def create_task(
+        self,
+        group_id: str,
+        task_id: str,
+        title: str,
+        *,
+        description: str = "",
+        assignee: Optional[str] = None,
+        due_ms: Optional[int] = None,
+        reward: int = 0,
+    ) -> str:
+        """Create a new task.
+
+        Args:
+            group_id: Group where task is created
+            task_id: Unique task identifier
+            title: Task title
+            description: Task description
+            assignee: Optional assignee public key (auto-assigns if provided)
+            due_ms: Optional deadline timestamp
+            reward: Token reward on completion
+
+        Returns:
+            task_id
+        """
+        with self._lock:
+            g = self._require_group(group_id)
+            tx = {
+                "type": "task_create",
+                "task_id": task_id,
+                "title": title,
+                "description": description,
+                "ts_ms": _now_ms(),
+            }
+            if assignee:
+                tx["assignee"] = assignee
+            if due_ms:
+                tx["due_ms"] = due_ms
+            if reward > 0:
+                tx["reward"] = reward
+            self._append_block(g, [tx])
+            self.log_event("task_create", {"group_id": group_id, "task_id": task_id})
+            logger.debug(f"Created task: id={task_id}, group={group_id}")
+            return task_id
+
+    def assign_task(self, group_id: str, task_id: str, assignee: str) -> None:
+        """Assign a task to an agent.
+
+        Args:
+            group_id: Group containing the task
+            task_id: Task to assign
+            assignee: Agent public key to assign to
+        """
+        with self._lock:
+            g = self._require_group(group_id)
+            tx = {
+                "type": "task_assign",
+                "task_id": task_id,
+                "assignee": assignee,
+                "ts_ms": _now_ms(),
+            }
+            self._append_block(g, [tx])
+            self.log_event("task_assign", {"group_id": group_id, "task_id": task_id, "assignee": assignee})
+
+    def start_task(self, group_id: str, task_id: str, *,
+                   signer_keys: Optional[NodeKeys] = None) -> None:
+        """Mark task as started (assignee only).
+
+        Args:
+            group_id: Group containing the task
+            task_id: Task to start
+            signer_keys: Optional keys to sign with (for multi-agent scenarios)
+        """
+        with self._lock:
+            g = self._require_group(group_id)
+            tx = {"type": "task_start", "task_id": task_id, "ts_ms": _now_ms()}
+            self._append_block(g, [tx], signer_keys=signer_keys)
+            self.log_event("task_start", {"group_id": group_id, "task_id": task_id})
+
+    def complete_task(
+        self, group_id: str, task_id: str, *, result_hash: Optional[str] = None,
+        signer_keys: Optional[NodeKeys] = None
+    ) -> None:
+        """Mark task as completed (assignee only).
+
+        Args:
+            group_id: Group containing the task
+            task_id: Task to complete
+            result_hash: Optional CAS hash of result artifact
+            signer_keys: Optional keys to sign with (for multi-agent scenarios)
+        """
+        with self._lock:
+            g = self._require_group(group_id)
+            tx = {"type": "task_complete", "task_id": task_id, "ts_ms": _now_ms()}
+            if result_hash:
+                tx["result_hash"] = result_hash
+            self._append_block(g, [tx], signer_keys=signer_keys)
+            self.log_event("task_complete", {"group_id": group_id, "task_id": task_id, "result_hash": result_hash})
+
+    def fail_task(
+        self, group_id: str, task_id: str, *, error_message: str = "",
+        signer_keys: Optional[NodeKeys] = None
+    ) -> None:
+        """Mark task as failed (assignee only).
+
+        Args:
+            group_id: Group containing the task
+            task_id: Task that failed
+            error_message: Optional error message
+            signer_keys: Optional keys to sign with (for multi-agent scenarios)
+        """
+        with self._lock:
+            g = self._require_group(group_id)
+            tx = {
+                "type": "task_fail",
+                "task_id": task_id,
+                "error_message": error_message,
+                "ts_ms": _now_ms(),
+            }
+            self._append_block(g, [tx], signer_keys=signer_keys)
+            self.log_event("task_fail", {"group_id": group_id, "task_id": task_id, "error_message": error_message})
+
+    def get_tasks(
+        self, group_id: str, *, status: Optional[str] = None, assignee: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Get tasks with optional filtering.
+
+        Args:
+            group_id: Group to query
+            status: Filter by status (pending, assigned, in_progress, completed, failed)
+            assignee: Filter by assignee public key
+
+        Returns:
+            List of task dicts
+        """
+        g = self._require_group(group_id)
+        tasks = list(g.chain.state.tasks.values())
+        if status:
+            tasks = [t for t in tasks if t["status"] == status]
+        if assignee:
+            tasks = [t for t in tasks if t.get("assignee") == assignee]
+        return tasks
+
+    # ---------- agent presence ----------
+
+    def update_presence(
+        self, group_id: str, status: str = "active", *, metadata: Optional[Dict[str, Any]] = None,
+        signer_keys: Optional[NodeKeys] = None
+    ) -> None:
+        """Update agent presence/heartbeat.
+
+        Args:
+            group_id: Group where agent is active
+            status: Status (active, idle, busy, offline)
+            metadata: Optional agent-specific metadata
+            signer_keys: Optional keys to sign with (for multi-agent scenarios)
+        """
+        with self._lock:
+            g = self._require_group(group_id)
+            tx = {"type": "presence", "status": status, "ts_ms": _now_ms()}
+            if metadata:
+                tx["metadata"] = metadata
+            self._append_block(g, [tx], signer_keys=signer_keys)
+            logger.debug(f"Updated presence: status={status}, group={group_id}")
+
+    def get_presence(
+        self, group_id: str, *, stale_threshold_ms: int = 300000
+    ) -> Dict[str, Dict[str, Any]]:
+        """Get presence status of all agents.
+
+        Args:
+            group_id: Group to query
+            stale_threshold_ms: Time after which agent is considered stale (default: 5 min)
+
+        Returns:
+            Dict of pub -> presence info with is_stale and age_ms
+        """
+        g = self._require_group(group_id)
+        now = _now_ms()
+        result = {}
+        for pub, p in g.chain.state.presence.items():
+            age_ms = now - p["last_seen_ms"]
+            result[pub] = {
+                **p,
+                "is_stale": age_ms > stale_threshold_ms,
+                "age_ms": age_ms,
+            }
+        return result
 
     # ---------- offers / market ----------
 
@@ -927,13 +1212,24 @@ class BatteryNode:
             raise NodeError(f"unknown group_id {group_id}")
         return g
 
-    def _append_block(self, g: Group, txs: List[Dict[str, Any]]) -> Block:
+    def _append_block(self, g: Group, txs: List[Dict[str, Any]], *,
+                      signer_keys: Optional[NodeKeys] = None) -> Block:
+        """Append a block to the group chain.
+
+        Args:
+            g: The group to append to
+            txs: List of transactions
+            signer_keys: Optional keys to sign the block with. If not provided,
+                        uses the node's default keys. This allows agents to sign
+                        blocks with their own identity.
+        """
+        keys = signer_keys or self.keys
         b = Block.make(
             g.chain.state.group_id,
             g.chain.head.height + 1,
             g.chain.head.block_id,
-            author_priv=self.keys.sign_priv,
-            author_pub_b64=self.keys.sign_pub_b64,
+            author_priv=keys.sign_priv,
+            author_pub_b64=keys.sign_pub_b64,
             txs=txs,
         )
         g.chain.append(b)

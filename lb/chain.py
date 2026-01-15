@@ -163,6 +163,14 @@ class GroupState:
     grants: Dict[str, Dict[str, Any]]  # key = f"{offer_id}:{buyer_pub}" -> grant dict
     processed_nonces: Dict[str, int]  # nonce_key -> timestamp_ms for replay prevention with expiry
     total_supply: int = 0  # Track total tokens in circulation
+    tasks: Dict[str, Dict[str, Any]] = None  # task_id -> task data
+    presence: Dict[str, Dict[str, Any]] = None  # pub -> presence data
+
+    def __post_init__(self):
+        if self.tasks is None:
+            self.tasks = {}
+        if self.presence is None:
+            self.presence = {}
 
     def snapshot(self) -> Dict[str, Any]:
         return {
@@ -183,6 +191,8 @@ class GroupState:
             "grants": dict(self.grants),
             "processed_nonces": dict(self.processed_nonces),
             "total_supply": self.total_supply,
+            "tasks": dict(self.tasks),
+            "presence": dict(self.presence),
         }
 
     def prune_expired_nonces(self, current_time_ms: int) -> int:
@@ -225,6 +235,8 @@ class GroupState:
             grants=dict(s.get("grants", {}) or {}),
             processed_nonces=nonces,
             total_supply=int(s.get("total_supply", 0)),
+            tasks=dict(s.get("tasks", {}) or {}),
+            presence=dict(s.get("presence", {}) or {}),
         )
         # ensure treasury exists
         state.balances.setdefault(TREASURY, 0)
@@ -580,6 +592,80 @@ class Chain:
                 if v is not None:
                     _require(v <= MAX_TOKEN_VALUE, "max_account_balance too large")
             return
+
+        # Task management transactions
+        if t == "task_create":
+            _require(author_pub in st.members, "task_create requires member")
+            task_id = tx.get("task_id")
+            _require(isinstance(task_id, str) and len(task_id) > 0, "task_create missing task_id")
+            _require(len(task_id) <= 256, "task_id too long (max 256)")
+            _require(task_id not in st.tasks, "task_id already exists")
+            title = tx.get("title")
+            _require(isinstance(title, str) and len(title) > 0, "task_create missing title")
+            _require(len(title) <= 256, "task title too long (max 256)")
+            if tx.get("description"):
+                _require(len(tx["description"]) <= 4096, "task description too long (max 4096)")
+            if tx.get("assignee"):
+                _require(tx["assignee"] in st.members, "task assignee must be a member")
+            if tx.get("reward"):
+                reward = tx["reward"]
+                _require(isinstance(reward, int) and reward >= 0, "invalid reward")
+                _require(reward <= MAX_TOKEN_VALUE, "reward too large")
+            return
+
+        if t == "task_assign":
+            _require(author_pub in st.members, "task_assign requires member")
+            task_id = tx.get("task_id")
+            _require(isinstance(task_id, str) and task_id in st.tasks, "unknown task_id")
+            task = st.tasks[task_id]
+            _require(task["status"] in ("pending", "assigned"), "task not assignable")
+            assignee = tx.get("assignee")
+            _require(isinstance(assignee, str), "task_assign missing assignee")
+            _require(assignee in st.members, "task assignee must be a member")
+            return
+
+        if t == "task_start":
+            _require(author_pub in st.members, "task_start requires member")
+            task_id = tx.get("task_id")
+            _require(isinstance(task_id, str) and task_id in st.tasks, "unknown task_id")
+            task = st.tasks[task_id]
+            _require(task["status"] == "assigned", "task must be assigned before starting")
+            _require(task.get("assignee") == author_pub, "only assignee can start task")
+            return
+
+        if t == "task_complete":
+            _require(author_pub in st.members, "task_complete requires member")
+            task_id = tx.get("task_id")
+            _require(isinstance(task_id, str) and task_id in st.tasks, "unknown task_id")
+            task = st.tasks[task_id]
+            _require(task["status"] == "in_progress", "task must be in_progress to complete")
+            _require(task.get("assignee") == author_pub, "only assignee can complete task")
+            return
+
+        if t == "task_fail":
+            _require(author_pub in st.members, "task_fail requires member")
+            task_id = tx.get("task_id")
+            _require(isinstance(task_id, str) and task_id in st.tasks, "unknown task_id")
+            task = st.tasks[task_id]
+            _require(task["status"] == "in_progress", "task must be in_progress to fail")
+            _require(task.get("assignee") == author_pub, "only assignee can fail task")
+            if tx.get("error_message"):
+                _require(len(tx["error_message"]) <= 1024, "error_message too long (max 1024)")
+            return
+
+        # Agent presence/heartbeat
+        if t == "presence":
+            _require(author_pub in st.members, "presence requires member")
+            status = tx.get("status", "active")
+            _require(status in ("active", "idle", "busy", "offline"), "invalid presence status")
+            # Limit metadata size to prevent abuse
+            metadata = tx.get("metadata", {})
+            if metadata:
+                import json
+                metadata_json = json.dumps(metadata)
+                _require(len(metadata_json) <= 4096, "presence metadata too large (max 4KB)")
+            return
+
         raise ChainError(f"unknown tx type {t}")
 
     def _apply_tx(self, tx: Dict[str, Any], st: GroupState, *, block_author: str = "") -> None:
@@ -720,6 +806,68 @@ class Chain:
             if "max_account_balance" in updates:
                 st.policy.max_account_balance = updates["max_account_balance"]
             return
+
+        # Task management
+        if t == "task_create":
+            task_id = tx["task_id"]
+            assignee = tx.get("assignee")
+            st.tasks[task_id] = {
+                "task_id": task_id,
+                "title": tx["title"],
+                "description": tx.get("description", ""),
+                "creator": block_author,
+                "assignee": assignee,
+                "status": "assigned" if assignee else "pending",
+                "created_ms": tx.get("ts_ms", int(time.time() * 1000)),
+                "due_ms": tx.get("due_ms"),
+                "reward": tx.get("reward", 0),
+            }
+            return
+
+        if t == "task_assign":
+            task = st.tasks[tx["task_id"]]
+            task["assignee"] = tx["assignee"]
+            task["status"] = "assigned"
+            task["assigned_ms"] = tx.get("ts_ms", int(time.time() * 1000))
+            return
+
+        if t == "task_start":
+            task = st.tasks[tx["task_id"]]
+            task["status"] = "in_progress"
+            task["started_ms"] = tx.get("ts_ms", int(time.time() * 1000))
+            return
+
+        if t == "task_complete":
+            task = st.tasks[tx["task_id"]]
+            task["status"] = "completed"
+            task["completed_ms"] = tx.get("ts_ms", int(time.time() * 1000))
+            task["result_hash"] = tx.get("result_hash")
+            # Mint reward to assignee
+            reward = task.get("reward", 0)
+            assignee = task.get("assignee")
+            if reward > 0 and assignee:
+                if _can_mint(st.policy, st.total_supply, reward):
+                    if _check_account_cap(st.policy, st.balances.get(assignee, 0), reward):
+                        st.balances[assignee] = st.balances.get(assignee, 0) + reward
+                        st.total_supply += reward
+            return
+
+        if t == "task_fail":
+            task = st.tasks[tx["task_id"]]
+            task["status"] = "failed"
+            task["failed_ms"] = tx.get("ts_ms", int(time.time() * 1000))
+            task["error_message"] = tx.get("error_message", "")
+            return
+
+        # Agent presence/heartbeat
+        if t == "presence":
+            st.presence[block_author] = {
+                "last_seen_ms": tx.get("ts_ms", int(time.time() * 1000)),
+                "status": tx.get("status", "active"),
+                "metadata": tx.get("metadata", {}),
+            }
+            return
+
         raise ChainError(f"cannot apply tx type {t}")
 
     def snapshot(self) -> Dict[str, Any]:

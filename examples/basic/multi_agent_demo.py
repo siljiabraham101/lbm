@@ -5,18 +5,18 @@ Multi-Agent Coordination Demo using Learning Batteries Market
 This demo simulates multiple AI agents working on a project together,
 using LBM as their shared knowledge layer for coordination.
 
+Demonstrates all v2 multi-agent coordination features:
+- Claim threading for conversations
+- Task management with state machine
+- Agent presence tracking
+- Time-windowed queries for "what's new"
+
 Scenario: Three agents collaborate to build a simple web API:
 - Agent "Architect": Designs the system structure
 - Agent "Developer": Implements the code
 - Agent "Reviewer": Reviews and suggests improvements
 
-Each agent:
-1. Queries existing knowledge before making decisions
-2. Publishes their work and decisions as claims
-3. Earns tokens for contributing knowledge
-4. Can see what other agents have done
-
-Run: python examples/multi_agent_demo.py
+Run: python examples/basic/multi_agent_demo.py
 """
 
 import asyncio
@@ -29,7 +29,7 @@ from typing import List, Dict, Any, Optional
 
 # Add parent to path for imports
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from lb.node import BatteryNode
 from lb.chain import TREASURY
@@ -43,14 +43,18 @@ class AgentMessage:
     content: str
     tags: List[str]
     timestamp: float
+    parent_hash: Optional[str] = None  # For threaded conversations
 
 
 class LBMAgent:
     """
     An AI agent that uses LBM for knowledge coordination.
 
-    In a real scenario, this would wrap an LLM API call.
-    For the demo, we simulate agent behavior.
+    Now with enhanced features:
+    - Task management (start, complete, fail)
+    - Presence heartbeat
+    - Threaded conversations
+    - Time-aware queries
     """
 
     def __init__(self, name: str, role: str, node: BatteryNode, group_id: str):
@@ -59,6 +63,8 @@ class LBMAgent:
         self.node = node
         self.group_id = group_id
         self.pub_key = node.keys.sign_pub_b64
+        self._last_seen_ms = int(time.time() * 1000)
+        self._current_task_id: Optional[str] = None
 
     def get_balance(self) -> int:
         """Get agent's token balance."""
@@ -67,48 +73,119 @@ class LBMAgent:
             return g.chain.state.balances.get(self.pub_key, 0)
         return 0
 
-    def query_context(self, query: str, top_k: int = 5) -> tuple:
+    def query_context(self, query: str, top_k: int = 5, since_ms: Optional[int] = None) -> tuple:
         """Query existing knowledge relevant to a topic.
+
+        Args:
+            query: Search query
+            top_k: Number of results
+            since_ms: Only include claims after this timestamp (optional)
 
         Returns:
             Tuple of (compiled_text, claim_hashes)
         """
-        slice_text, claim_hashes = self.node.compile_context(self.group_id, query, top_k=top_k)
-        return slice_text, claim_hashes
+        return self.node.compile_context(self.group_id, query, top_k=top_k, since_ms=since_ms)
 
-    def publish_claim(self, content: str, tags: List[str], msg_type: str = "knowledge") -> str:
-        """Publish a knowledge claim and earn reward tokens."""
-        # Format: include agent name and type in the claim
+    def publish_claim(
+        self,
+        content: str,
+        tags: List[str],
+        msg_type: str = "knowledge",
+        parent_hash: Optional[str] = None,
+    ) -> str:
+        """Publish a knowledge claim and earn reward tokens.
+
+        Args:
+            content: The claim content
+            tags: Tags for categorization
+            msg_type: Type of message
+            parent_hash: Optional parent claim for threading
+
+        Returns:
+            Claim hash
+        """
         full_content = f"[{self.name}:{msg_type}] {content}"
         claim_hash = self.node.publish_claim(
             self.group_id,
             text=full_content,
-            tags=[self.role, msg_type] + tags
+            tags=[self.role, msg_type] + tags,
+            parent_hash=parent_hash,
         )
         return claim_hash
 
+    def reply_to(self, parent_hash: str, content: str, tags: List[str], msg_type: str = "answer") -> str:
+        """Reply to an existing claim (threaded conversation)."""
+        return self.publish_claim(content, tags, msg_type=msg_type, parent_hash=parent_hash)
+
+    def get_recent_claims(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get claims published since last check."""
+        claims = self.node.get_recent_claims(self.group_id, self._last_seen_ms, limit=limit)
+        if claims:
+            self._last_seen_ms = max(c["created_ms"] for c in claims) + 1
+        return claims
+
+    def update_presence(self, status: str = "active", metadata: Optional[Dict] = None) -> None:
+        """Update agent's presence status."""
+        self.node.update_presence(self.group_id, status, metadata=metadata or {"role": self.role})
+
+    def get_presence(self) -> Dict[str, Any]:
+        """Get presence status of all agents."""
+        return self.node.get_presence(self.group_id)
+
+    def create_task(self, task_id: str, title: str, assignee_pub: Optional[str] = None, reward: int = 10) -> None:
+        """Create a new task (auto-assigns to self if no assignee specified)."""
+        # Auto-assign to self if no assignee specified
+        if assignee_pub is None:
+            assignee_pub = self.pub_key
+        self.node.create_task(
+            self.group_id,
+            task_id=task_id,
+            title=title,
+            assignee=assignee_pub,
+            reward=reward,
+        )
+
+    def start_task(self, task_id: str) -> None:
+        """Start working on a task."""
+        self.node.start_task(self.group_id, task_id)
+        self._current_task_id = task_id
+        self.update_presence("busy", metadata={"current_task": task_id})
+
+    def complete_task(self, task_id: str, result_hash: Optional[str] = None) -> None:
+        """Complete a task."""
+        self.node.complete_task(self.group_id, task_id, result_hash=result_hash)
+        self._current_task_id = None
+        self.update_presence("active")
+
+    def fail_task(self, task_id: str, error_message: str = "") -> None:
+        """Mark a task as failed."""
+        self.node.fail_task(self.group_id, task_id, error_message=error_message)
+        self._current_task_id = None
+        self.update_presence("active")
+
+    def get_tasks(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get tasks, optionally filtered by status."""
+        return self.node.get_tasks(self.group_id, status=status)
+
     def think(self, context: str) -> str:
-        """
-        Simulate agent thinking/reasoning.
-        In real usage, this would call an LLM API.
-        """
-        # This is where you'd integrate with Claude API, OpenAI, etc.
+        """Simulate agent thinking/reasoning."""
         return f"[{self.name} thinking about: {context[:50]}...]"
 
 
 def print_separator(title: str = ""):
     """Print a visual separator."""
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     if title:
         print(f"  {title}")
-        print("=" * 60)
+        print("=" * 70)
     print()
 
 
 def print_agent_action(agent: LBMAgent, action: str, details: str = ""):
     """Print agent action with formatting."""
     balance = agent.get_balance()
-    print(f"[{agent.name}] ({agent.role}, {balance} tokens)")
+    status = "busy" if agent._current_task_id else "active"
+    print(f"[{agent.name}] ({agent.role}, {balance} tokens, {status})")
     print(f"  Action: {action}")
     if details:
         for line in details.split("\n"):
@@ -117,11 +194,17 @@ def print_agent_action(agent: LBMAgent, action: str, details: str = ""):
 
 
 async def run_demo():
-    """Run the multi-agent coordination demo."""
+    """Run the enhanced multi-agent coordination demo."""
 
-    print_separator("Learning Batteries Market - Multi-Agent Coordination Demo")
+    print_separator("Learning Batteries Market - Multi-Agent Coordination Demo v2")
+    print("Enhanced Features:")
+    print("  - Claim Threading: Conversations with parent_hash")
+    print("  - Task Management: create → assign → start → complete/fail")
+    print("  - Agent Presence: Heartbeat with stale detection")
+    print("  - Time Queries: Get 'what's new' since last check")
+    print()
     print("Scenario: Three AI agents collaborate to build a REST API")
-    print("They share knowledge through LBM and earn tokens for contributions.\n")
+    print()
 
     # Create temporary directory for demo
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -134,179 +217,201 @@ async def run_demo():
 
         # Create a knowledge group for the project
         print("\nCreating project knowledge group...")
-        group_id = node.create_group("project:api-builder")
+        group_id = node.create_group("project:api-builder-v2")
         print(f"  Group ID: {group_id}")
 
         # Configure token economy
         print("\nConfiguring token economy...")
         node.update_group_policy(
             group_id,
-            faucet_amount=100,        # New agents get 100 tokens
-            claim_reward_amount=10,   # 10 tokens per knowledge claim
-            transfer_fee_bps=100,     # 1% transfer fee to treasury
+            faucet_amount=100,
+            claim_reward_amount=10,
+            transfer_fee_bps=100,
         )
         print("  - Faucet: 100 tokens for new members")
         print("  - Claim reward: 10 tokens per contribution")
         print("  - Transfer fee: 1%")
 
-        # Get token stats
-        stats = node.get_token_stats(group_id)
-        print(f"\nInitial token stats:")
-        print(f"  Total supply: {stats['total_supply']}")
-
-        # The node owner is the first agent (Architect)
+        # Create agents
         architect = LBMAgent("Architect", "architect", node, group_id)
-        print(f"\nArchitect agent initialized (balance: {architect.get_balance()} tokens)")
+        print(f"\nArchitect initialized (balance: {architect.get_balance()} tokens)")
 
-        # For demo purposes, we'll simulate other agents by having them
-        # publish through the same node (in real usage, each would have their own node)
-        # We'll mint tokens to simulate their faucet
+        # Update presence for all agents
+        architect.update_presence("active", metadata={"specialization": "system-design"})
 
-        print_separator("Phase 1: Architecture Design")
+        print_separator("Phase 1: Architecture Design with Threading")
 
-        # Architect publishes system design
-        print_agent_action(architect, "Publishing system architecture")
+        # Create a task for architecture design
+        architect.create_task("arch_design", "Design API architecture", reward=50)
+        print("  Created task: arch_design (reward=50)")
 
-        architect.publish_claim(
-            "System Architecture Decision: We will build a REST API using FastAPI framework. "
-            "Reasons: 1) Async support for better performance, 2) Automatic OpenAPI docs, "
-            "3) Type hints for better code quality.",
-            tags=["architecture", "framework", "fastapi"],
+        # Start the task
+        architect.start_task("arch_design")
+        print_agent_action(architect, "Started task: arch_design")
+
+        # Architect publishes initial question
+        question_hash = architect.publish_claim(
+            "Question: What framework should we use for this REST API project?",
+            tags=["architecture", "question"],
+            msg_type="question"
+        )
+        print(f"  Published question: {question_hash[:16]}...")
+
+        # Architect answers own question (threaded reply)
+        answer_hash = architect.reply_to(
+            question_hash,
+            "Answer: FastAPI is recommended for async support and automatic OpenAPI docs.",
+            tags=["architecture", "framework"],
+            msg_type="answer"
+        )
+        print(f"  Replied with answer (threaded): {answer_hash[:16]}...")
+
+        # Verify threading
+        g = node.groups[group_id]
+        answer_claim = g.graph.claims.get(answer_hash)
+        assert answer_claim.parent_hash == question_hash, "Threading verification failed!"
+        print("  ✓ Thread chain verified")
+
+        # Publish more architecture decisions
+        design_hash = architect.publish_claim(
+            "API Endpoints: GET/POST/PUT/DELETE /users with Pydantic validation",
+            tags=["architecture", "endpoints"],
             msg_type="decision"
         )
 
-        architect.publish_claim(
-            "API Endpoints Design: "
-            "GET /users - List all users, "
-            "POST /users - Create user, "
-            "GET /users/{id} - Get user by ID, "
-            "PUT /users/{id} - Update user, "
-            "DELETE /users/{id} - Delete user",
-            tags=["architecture", "endpoints", "rest"],
-            msg_type="design"
-        )
+        # Complete the architecture task with the design as result
+        architect.complete_task("arch_design", result_hash=design_hash)
+        print(f"  Completed task with result: {design_hash[:16]}...")
+        print(f"  Balance after task completion: {architect.get_balance()} tokens")
 
-        architect.publish_claim(
-            "Data Model: User entity with fields: id (int), name (str), email (str), "
-            "created_at (datetime). Use Pydantic for validation.",
-            tags=["architecture", "data-model", "pydantic"],
-            msg_type="design"
-        )
+        print_separator("Phase 2: Development with Task Tracking")
 
-        # Check architect's balance after publishing
-        print(f"  Architect balance after contributions: {architect.get_balance()} tokens")
+        # Record timestamp before new phase
+        phase2_start = int(time.time() * 1000)
+        time.sleep(0.05)  # Small delay to ensure timestamp difference
 
-        print_separator("Phase 2: Development")
+        # Create development tasks
+        architect.create_task("impl_models", "Implement data models", reward=20)
+        architect.create_task("impl_endpoints", "Implement API endpoints", reward=30)
+        architect.create_task("impl_tests", "Write unit tests", reward=20)
 
-        # Developer queries for context before coding
-        print_agent_action(architect, "Developer queries existing knowledge",
-                          "Query: 'API framework and endpoints'")
+        tasks = architect.get_tasks()
+        print(f"  Created {len(tasks)} tasks")
+        for t in tasks:
+            print(f"    - {t['task_id']}: {t['title']} (status={t['status']}, reward={t.get('reward', 0)})")
 
-        compiled_text, claim_hashes = architect.query_context("API framework endpoints design")
-        print(f"  Found {len(claim_hashes)} relevant knowledge items:")
-        # Show snippet of compiled context
-        for i, line in enumerate(compiled_text.split("\n")[:3], 1):
-            if line.strip():
-                print(f"    {i}. {line[:70]}...")
-        print()
+        # Start and complete first task
+        architect.start_task("impl_models")
+        print_agent_action(architect, "Working on: impl_models")
 
-        # Developer publishes implementation
-        print_agent_action(architect, "Developer publishes implementation")
-
-        architect.publish_claim(
-            "Implementation: Created main.py with FastAPI app. "
-            "Added User model using Pydantic BaseModel. "
-            "Implemented all CRUD endpoints as per architecture.",
-            tags=["implementation", "code", "fastapi"],
+        model_hash = architect.publish_claim(
+            "Implementation: Created User model with Pydantic BaseModel, fields: id, name, email",
+            tags=["implementation", "models", "pydantic"],
             msg_type="code"
         )
+        architect.complete_task("impl_models", result_hash=model_hash)
+        print(f"  ✓ Completed impl_models")
 
-        architect.publish_claim(
-            "Implementation Detail: Added input validation using Pydantic. "
-            "Email field uses EmailStr type for automatic validation. "
-            "All endpoints return proper HTTP status codes.",
-            tags=["implementation", "validation", "pydantic"],
+        # Start and complete second task
+        architect.start_task("impl_endpoints")
+        endpoint_hash = architect.publish_claim(
+            "Implementation: All CRUD endpoints with proper error handling and HTTP status codes",
+            tags=["implementation", "endpoints"],
             msg_type="code"
         )
+        architect.complete_task("impl_endpoints", result_hash=endpoint_hash)
+        print(f"  ✓ Completed impl_endpoints")
 
-        architect.publish_claim(
-            "Testing: Created test_api.py with pytest. "
-            "Tests cover: user creation, retrieval, update, deletion, "
-            "and error cases (404 for missing users, 422 for invalid input).",
-            tags=["implementation", "testing", "pytest"],
+        # Start and complete tests task
+        architect.start_task("impl_tests")
+        test_hash = architect.publish_claim(
+            "Testing: pytest suite with 95% coverage, includes edge cases and error scenarios",
+            tags=["implementation", "testing"],
             msg_type="code"
         )
+        architect.complete_task("impl_tests", result_hash=test_hash)
+        print(f"  ✓ Completed impl_tests")
 
-        print(f"  Balance after development phase: {architect.get_balance()} tokens")
+        print(f"\n  Balance after development: {architect.get_balance()} tokens")
 
-        print_separator("Phase 3: Code Review")
+        print_separator("Phase 3: Review with Threaded Discussion")
 
-        # Reviewer queries all knowledge
-        print_agent_action(architect, "Reviewer queries implementation details",
-                          "Query: 'implementation validation security'")
+        # Create review task
+        architect.create_task("code_review", "Review implementation for security", reward=30)
+        architect.start_task("code_review")
 
-        compiled_text, claim_hashes = architect.query_context("implementation validation security")
-        print(f"  Found {len(claim_hashes)} items to review")
-        print()
+        # Query recent knowledge using time filter
+        print_agent_action(architect, "Reviewing recent implementation",
+                          f"Querying claims since phase 2 start ({phase2_start})")
 
-        # Reviewer publishes feedback
-        print_agent_action(architect, "Reviewer publishes review findings")
+        compiled, hashes = architect.query_context("implementation security", top_k=5, since_ms=phase2_start)
+        print(f"  Found {len(hashes)} relevant recent claims")
 
-        architect.publish_claim(
-            "Review Finding: Missing rate limiting on endpoints. "
-            "Recommendation: Add slowapi for rate limiting to prevent abuse.",
-            tags=["review", "security", "rate-limiting"],
+        # Post review as reply to implementation
+        review_hash = architect.reply_to(
+            endpoint_hash,
+            "Review: Missing rate limiting. Recommendation: Add slowapi for API protection.",
+            tags=["review", "security"],
             msg_type="review"
         )
 
-        architect.publish_claim(
-            "Review Finding: No authentication implemented. "
-            "Recommendation: Add JWT-based auth using python-jose. "
-            "Protect write endpoints (POST, PUT, DELETE).",
-            tags=["review", "security", "authentication"],
+        # Follow-up reply (deeper threading)
+        followup_hash = architect.reply_to(
+            review_hash,
+            "Follow-up: Also add JWT authentication for protected endpoints.",
+            tags=["review", "security", "auth"],
             msg_type="review"
         )
 
-        architect.publish_claim(
-            "Review Approval: Code structure is clean and follows best practices. "
-            "Type hints are used consistently. Tests have good coverage.",
-            tags=["review", "approval", "quality"],
-            msg_type="review"
+        # Verify deep threading
+        g = node.groups[group_id]
+        followup_claim = g.graph.claims.get(followup_hash)
+        review_claim = g.graph.claims.get(review_hash)
+        assert followup_claim.parent_hash == review_hash, "Deep threading failed!"
+        assert review_claim.parent_hash == endpoint_hash, "Review threading failed!"
+        print("  ✓ Deep thread chain verified (3 levels)")
+
+        architect.complete_task("code_review", result_hash=review_hash)
+
+        print_separator("Phase 4: Time-Windowed Queries")
+
+        # Get recent updates
+        print("Testing time-windowed queries...")
+
+        # Get claims from the beginning
+        all_recent = node.get_recent_claims(group_id, 0, limit=100)
+        print(f"  Total claims: {len(all_recent)}")
+
+        # Get claims since phase 2
+        phase2_claims = node.get_recent_claims(group_id, phase2_start, limit=100)
+        print(f"  Claims since Phase 2: {len(phase2_claims)}")
+
+        # Compile context with time filter
+        recent_context, recent_hashes = architect.query_context(
+            "security implementation",
+            top_k=5,
+            since_ms=phase2_start
         )
+        print(f"  Security-related recent claims: {len(recent_hashes)}")
 
-        print(f"  Balance after review phase: {architect.get_balance()} tokens")
+        print_separator("Phase 5: Agent Presence")
 
-        print_separator("Phase 4: Knowledge Compilation")
+        # Update and check presence
+        architect.update_presence("active", metadata={"phase": "complete", "specialization": "system-design"})
 
-        # Compile all project knowledge
-        print("Compiling project knowledge summary...")
-        print()
-
-        # Query different aspects
-        queries = [
-            ("Architecture decisions", "architecture decision framework"),
-            ("Implementation details", "implementation code endpoints"),
-            ("Review findings", "review security recommendation"),
-        ]
-
-        for title, query in queries:
-            print(f"  {title}:")
-            compiled_text, claim_hashes = architect.query_context(query, top_k=3)
-            # Show first few lines of compiled context
-            lines = [l for l in compiled_text.split("\n") if l.strip()][:3]
-            for line in lines:
-                # Extract the main content
-                if "]" in line:
-                    line = line.split("]", 1)[1].strip()
-                print(f"    - {line[:70]}...")
-            print()
+        presence = architect.get_presence()
+        print(f"Agent Presence Status:")
+        for pub_key, info in presence.items():
+            stale = "STALE" if info.get("is_stale") else "active"
+            print(f"  - {info.get('status', 'unknown')} ({stale})")
+            if info.get("metadata"):
+                print(f"    Metadata: {info['metadata']}")
 
         print_separator("Final Statistics")
 
-        # Get final token stats
+        # Get final stats
+        state = node.groups[group_id].chain.state
         stats = node.get_token_stats(group_id)
-        g = node.groups[group_id]
-        state = g.chain.state
 
         print("Token Economy:")
         print(f"  Total supply: {stats['total_supply']} tokens")
@@ -314,30 +419,36 @@ async def run_demo():
         print(f"  Agent balance: {architect.get_balance()} tokens")
         print()
 
+        # Task statistics
+        all_tasks = architect.get_tasks()
+        completed_tasks = [t for t in all_tasks if t["status"] == "completed"]
+        print("Task Management:")
+        print(f"  Total tasks: {len(all_tasks)}")
+        print(f"  Completed: {len(completed_tasks)}")
+        print(f"  Total rewards earned: {sum(t.get('reward', 0) for t in completed_tasks)} tokens")
+        print()
+
         print("Knowledge Base:")
-        # Count claims
-        claim_count = sum(1 for tx in _get_all_txs(g) if tx.get("type") == "claim")
-        print(f"  Total claims published: {claim_count}")
+        print(f"  Total claims: {len(all_recent)}")
+        print(f"  Threaded conversations: Yes (verified)")
+        print(f"  Time filtering: Yes (verified)")
+        g = node.groups[group_id]
         print(f"  Chain height: {g.chain.head.height}")
         print()
 
-        print("Group Policy:")
-        print(f"  Faucet amount: {state.policy.faucet_amount} tokens")
-        print(f"  Claim reward: {state.policy.claim_reward_amount} tokens")
-        print(f"  Transfer fee: {state.policy.transfer_fee_bps / 100}%")
-        print()
-
         print_separator("Demo Complete!")
-        print("This demo showed how AI agents can:")
-        print("  1. Share knowledge through a distributed ledger")
-        print("  2. Query existing knowledge before making decisions")
-        print("  3. Earn tokens for contributing valuable knowledge")
-        print("  4. Build a shared understanding of a project")
+        print("This enhanced demo demonstrated:")
+        print("  1. Claim Threading: Question → Answer → Follow-up chains")
+        print("  2. Task Management: Create → Start → Complete lifecycle")
+        print("  3. Agent Presence: Status updates with metadata")
+        print("  4. Time-Windowed Queries: Filter by timestamp")
+        print("  5. Reward Economy: Tokens earned for tasks and claims")
         print()
-        print("In production, each agent would:")
-        print("  - Run their own LBM node")
-        print("  - Sync with peers over P2P network")
-        print("  - Use MCP interface for LLM integration")
+        print("In production, use via MCP tools:")
+        print("  - publish_claim with parent_hash for threading")
+        print("  - create_task, start_task, complete_task for workflows")
+        print("  - update_presence, get_presence for coordination")
+        print("  - get_recent_claims, watch_claims for updates")
         print()
 
 

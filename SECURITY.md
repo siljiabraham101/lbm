@@ -107,11 +107,6 @@ Every purchase transaction requires a unique nonce:
 - Tracked in chain state with timestamp
 - Expires after 24 hours (configurable)
 
-```python
-# Nonce format: buyer_pub + offer_id -> nonce
-nonce_key = f"{buyer_pub}:{offer_id}"
-```
-
 ### Transport-Level Replay
 
 - Monotonic counters on each direction
@@ -156,6 +151,35 @@ All user inputs are validated:
 | Tags | 20 max, 64 chars each | Alphanumeric + dashes |
 | Group name | 128 chars | Alphanumeric + colons/dashes/underscores |
 | Nonce | 32+ chars | Hex characters |
+| Task ID | 256 chars | Non-empty string |
+| Task title | 256 chars | Non-empty string |
+| Task description | 4 KB | UTF-8 |
+| Error message | 1 KB | UTF-8 |
+| Presence metadata | 4 KB | JSON object |
+
+## Multi-Agent Coordination Security
+
+### Task Management
+
+- **Task ID validation**: Non-empty, max 256 characters
+- **Title validation**: Non-empty, max 256 characters
+- **Assignee validation**: Must be a group member
+- **State machine enforcement**: Invalid transitions rejected
+  - Only assignee can start/complete/fail tasks
+  - Must be assigned before starting
+  - Must be in_progress before completing/failing
+- **Reward bounds**: Non-negative integer values
+
+### Agent Presence
+
+- **Metadata size limit**: Max 4KB JSON
+- **Status validation**: Must be one of: `active`, `idle`, `busy`, `offline`
+- **Member check**: Only group members can update presence
+
+### Claim Threading
+
+- **Parent validation**: Parent claim must exist in group
+- **Cycle prevention**: Threading is strictly parent-child (no loops)
 
 ## Token Economy Security
 
@@ -267,15 +291,6 @@ export LB_NONCE_EXPIRY_MS=3600000  # 1 hour
 - For state atomicity: Single-threaded operation mode available
 - For key storage: Consider OS-level memory protection (mlock)
 
-## Vulnerability Reporting
-
-If you discover a security vulnerability:
-
-1. Do NOT open a public issue
-2. Email security details privately
-3. Include reproduction steps
-4. Allow reasonable time for fix before disclosure
-
 ## Admin Panel Security
 
 The web admin panel (`lb run-admin`) implements security measures:
@@ -283,7 +298,7 @@ The web admin panel (`lb run-admin`) implements security measures:
 ### CORS Policy
 
 - CORS restricted to localhost origins only
-- Strict matching prevents subdomain spoofing (e.g., `localhost.evil.com`)
+- Strict matching prevents subdomain spoofing
 - Allowed origins: `http://localhost`, `http://127.0.0.1` (with any port)
 
 ### Recommendations
@@ -306,12 +321,11 @@ export LB_SYNC_RETRY_DELAY_S=60   # Delay between retries
 export LB_SYNC_MAX_RETRIES=3      # Max failures before disable
 ```
 
-## Security Updates
+## Vulnerability Reporting
 
-See [CHANGELOG.md](CHANGELOG.md) for security-related changes.
+If you discover a security vulnerability:
 
-### Recent Fixes (v0.4.1)
-
-- **CORS Subdomain Spoofing**: Fixed vulnerability allowing `localhost.evil.com` bypass
-- **Connection Race Condition**: Fixed P2P connection slot leak on rate limiter error
-- **Sync Daemon Backoff**: Added retry backoff to prevent peer hammering
+1. Do NOT open a public issue
+2. Email security details privately
+3. Include reproduction steps
+4. Allow reasonable time for fix before disclosure

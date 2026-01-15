@@ -1,13 +1,14 @@
 """Encrypted key storage for Learning Battery Market.
 
 Implements password-based encryption for key material at rest using:
-- Argon2id for key derivation (memory-hard, side-channel resistant)
+- Scrypt for key derivation (N=2^17, r=8, p=1 - memory-hard, well-vetted)
 - ChaCha20-Poly1305 for authenticated encryption
 
 Security considerations:
 - Keys are encrypted individually with unique salts and nonces
-- Argon2id parameters tuned for reasonable security/performance trade-off
+- Scrypt parameters tuned for strong security (128MB memory cost)
 - File permissions enforced via ensure_mode_600()
+- Parameters are intentionally fixed (not configurable) to prevent weakening
 """
 from __future__ import annotations
 

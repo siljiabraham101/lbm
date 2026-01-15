@@ -13,8 +13,45 @@ from .mcp import run_mcp
 
 
 def _cmd_init(args: argparse.Namespace) -> None:
-    BatteryNode.init(Path(args.data))
+    if getattr(args, 'encrypt_keys', False):
+        import getpass
+        password = getpass.getpass("Enter key encryption password: ")
+        confirm = getpass.getpass("Confirm password: ")
+        if password != confirm:
+            print("Passwords don't match", file=sys.stderr)
+            sys.exit(1)
+        from .key_encryption import init_encrypted_keys
+        init_encrypted_keys(Path(args.data), password)
+    else:
+        BatteryNode.init(Path(args.data))
     print(f"initialized node at {args.data}")
+
+
+def _cmd_encrypt_keys(args: argparse.Namespace) -> None:
+    """Encrypt existing unencrypted keys."""
+    import getpass
+    from .key_encryption import encrypt_existing_keys
+    password = getpass.getpass("Enter new encryption password: ")
+    confirm = getpass.getpass("Confirm password: ")
+    if password != confirm:
+        print("Passwords don't match", file=sys.stderr)
+        sys.exit(1)
+    encrypt_existing_keys(Path(args.data), password)
+    print("Keys encrypted successfully")
+
+
+def _cmd_change_password(args: argparse.Namespace) -> None:
+    """Change key encryption password."""
+    import getpass
+    from .key_encryption import change_key_password
+    old_pass = getpass.getpass("Enter current password: ")
+    new_pass = getpass.getpass("Enter new password: ")
+    confirm = getpass.getpass("Confirm new password: ")
+    if new_pass != confirm:
+        print("New passwords don't match", file=sys.stderr)
+        sys.exit(1)
+    change_key_password(Path(args.data), old_pass, new_pass)
+    print("Password changed successfully")
 
 
 def _cmd_info(args: argparse.Namespace) -> None:
@@ -323,7 +360,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("init", help="initialize a new node data directory")
+    s.add_argument("--encrypt-keys", action="store_true", help="encrypt keys with password")
     s.set_defaults(func=_cmd_init)
+
+    s = sub.add_parser("encrypt-keys", help="encrypt existing unencrypted keys")
+    s.set_defaults(func=_cmd_encrypt_keys)
+
+    s = sub.add_parser("change-password", help="change key encryption password")
+    s.set_defaults(func=_cmd_change_password)
 
     s = sub.add_parser("info", help="print node info as JSON")
     s.set_defaults(func=_cmd_info)

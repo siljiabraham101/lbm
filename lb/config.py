@@ -96,6 +96,14 @@ class ValidationConfig:
     max_package_size_bytes: int = field(default_factory=lambda: _env_int("LB_MAX_PACKAGE_SIZE", 10 * 1024 * 1024))  # 10MB
     max_experience_size_bytes: int = field(default_factory=lambda: _env_int("LB_MAX_EXPERIENCE_SIZE", 1 * 1024 * 1024))  # 1MB
 
+    # Task management limits
+    max_task_title_length: int = field(default_factory=lambda: _env_int("LB_MAX_TASK_TITLE_LENGTH", 256))
+    max_task_description_length: int = field(default_factory=lambda: _env_int("LB_MAX_TASK_DESC_LENGTH", 4096))
+    max_error_message_length: int = field(default_factory=lambda: _env_int("LB_MAX_ERROR_MSG_LENGTH", 1024))
+
+    # Presence/heartbeat
+    default_presence_stale_ms: int = field(default_factory=lambda: _env_int("LB_PRESENCE_STALE_MS", 300000))  # 5 minutes
+
 
 @dataclass
 class LoggingConfig:
@@ -109,12 +117,12 @@ class LoggingConfig:
 
 @dataclass
 class CryptoConfig:
-    """Configuration for cryptographic operations."""
+    """Configuration for cryptographic operations.
 
-    # Key derivation
-    scrypt_n: int = field(default_factory=lambda: _env_int("LB_SCRYPT_N", 2**14))
-    scrypt_r: int = field(default_factory=lambda: _env_int("LB_SCRYPT_R", 8))
-    scrypt_p: int = field(default_factory=lambda: _env_int("LB_SCRYPT_P", 1))
+    Note: Key encryption parameters (Scrypt N/r/p) are intentionally fixed
+    in lb/key_encryption.py for security. They are not configurable to prevent
+    accidental weakening of key protection.
+    """
 
     # Signature verification
     require_signature_verification: bool = field(default_factory=lambda: _env_bool("LB_REQUIRE_SIG_VERIFY", True))

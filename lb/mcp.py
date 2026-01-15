@@ -1,3 +1,33 @@
+"""
+MCP (Model Context Protocol) interface for Learning Battery Market.
+
+This module provides a JSON-RPC over stdin/stdout interface for AI agent
+integration. It allows agents to publish claims, query context, manage tasks,
+and interact with the knowledge market.
+
+IMPORTANT: Single Identity Limitation
+=====================================
+The MCP interface operates with the identity of the node it's connected to.
+All operations (claims, tasks, presence) are signed by the node's key.
+
+For multi-agent scenarios where each agent needs a distinct identity:
+- Use the Python API directly with the `signer_keys` parameter
+- Generate per-agent keys via `gen_node_keys()`
+- Pass agent keys to methods like `publish_claim()`, `start_task()`, etc.
+
+Example multi-agent setup (Python API):
+    from lb.keys import gen_node_keys
+    from lb.node import BatteryNode
+
+    node = BatteryNode.load(data_dir)
+    agent_keys = gen_node_keys()
+    node.add_member(group_id, agent_keys.sign_pub_b64, role="member")
+    node.publish_claim(group_id, "content", ["tags"], signer_keys=agent_keys)
+
+The MCP interface is best suited for:
+- Single-agent integrations
+- Centralized coordinator patterns where one identity manages all operations
+"""
 from __future__ import annotations
 
 import asyncio
@@ -80,7 +110,8 @@ def run_mcp(data_dir: str) -> None:
                 gid = params["group_id"]
                 text = params["text"]
                 tags = list(params.get("tags", []))
-                h = node.publish_claim(gid, text, tags)
+                parent_hash = params.get("parent_hash")  # Optional threading
+                h = node.publish_claim(gid, text, tags, parent_hash=parent_hash)
                 _ok(rid, {"claim_hash": h})
             elif method == "retract_claim":
                 node.retract_claim(params["group_id"], params["claim_hash"])
@@ -94,7 +125,10 @@ def run_mcp(data_dir: str) -> None:
                 gid = params["group_id"]
                 q = params["query"]
                 top_k = int(params.get("top_k", 8))
-                text, chosen = node.compile_context(gid, q, top_k=top_k)
+                since_ms = params.get("since_ms")  # Optional time filter
+                if since_ms is not None:
+                    since_ms = int(since_ms)
+                text, chosen = node.compile_context(gid, q, top_k=top_k, since_ms=since_ms)
                 _ok(rid, {"context": text, "claim_hashes": chosen})
             elif method == "create_offer":
                 gid = params["group_id"]
@@ -130,6 +164,102 @@ def run_mcp(data_dir: str) -> None:
                 except Exception:
                     pkg = {"raw_b64": base64.b64encode(pt).decode("ascii")}
                 _ok(rid, {"package_hash": package_hash, "package": pkg})
+
+            # ========== Task Management ==========
+            elif method == "create_task":
+                gid = _require_str(params, "group_id")
+                task_id = _require_str(params, "task_id")
+                title = _require_str(params, "title")
+                description = params.get("description", "")
+                assignee = params.get("assignee")
+                due_ms = int(params["due_ms"]) if params.get("due_ms") else None
+                reward = int(params.get("reward", 0))
+                node.create_task(gid, task_id, title, description=description, assignee=assignee, due_ms=due_ms, reward=reward)
+                _ok(rid, {"task_id": task_id})
+
+            elif method == "assign_task":
+                gid = _require_str(params, "group_id")
+                task_id = _require_str(params, "task_id")
+                assignee = _require_str(params, "assignee")
+                node.assign_task(gid, task_id, assignee)
+                _ok(rid, {"ok": True})
+
+            elif method == "start_task":
+                gid = _require_str(params, "group_id")
+                task_id = _require_str(params, "task_id")
+                node.start_task(gid, task_id)
+                _ok(rid, {"ok": True})
+
+            elif method == "complete_task":
+                gid = _require_str(params, "group_id")
+                task_id = _require_str(params, "task_id")
+                result_hash = params.get("result_hash")
+                node.complete_task(gid, task_id, result_hash=result_hash)
+                _ok(rid, {"ok": True})
+
+            elif method == "fail_task":
+                gid = _require_str(params, "group_id")
+                task_id = _require_str(params, "task_id")
+                error_message = params.get("error_message", "")
+                node.fail_task(gid, task_id, error_message=error_message)
+                _ok(rid, {"ok": True})
+
+            elif method == "list_tasks":
+                gid = _require_str(params, "group_id")
+                status = params.get("status")
+                assignee = params.get("assignee")
+                tasks = node.get_tasks(gid, status=status, assignee=assignee)
+                _ok(rid, {"tasks": tasks})
+
+            # ========== Agent Presence ==========
+            elif method == "update_presence":
+                gid = _require_str(params, "group_id")
+                status = params.get("status", "active")
+                metadata = params.get("metadata")
+                node.update_presence(gid, status, metadata=metadata)
+                _ok(rid, {"ok": True})
+
+            elif method == "get_presence":
+                gid = _require_str(params, "group_id")
+                stale_threshold_ms = int(params.get("stale_threshold_ms", 300000))
+                presence = node.get_presence(gid, stale_threshold_ms=stale_threshold_ms)
+                _ok(rid, {"presence": presence})
+
+            # ========== Time-Windowed Queries ==========
+            elif method == "get_recent_claims":
+                gid = _require_str(params, "group_id")
+                since_ms = _require_int(params, "since_ms")
+                limit = int(params.get("limit", 100))
+                claims = node.get_recent_claims(gid, since_ms, limit=limit)
+                _ok(rid, {"claims": claims, "count": len(claims)})
+
+            elif method == "watch_claims":
+                # Polling-based subscription: returns claims since cursor
+                gid = _require_str(params, "group_id")
+                last_seen_ms = _require_int(params, "last_seen_ms")
+                limit = int(params.get("limit", 50))
+                claims = node.get_recent_claims(gid, last_seen_ms, limit=limit)
+                # Return next cursor for pagination
+                next_cursor = max((c["created_ms"] for c in claims), default=last_seen_ms) + 1 if claims else last_seen_ms
+                _ok(rid, {"claims": claims, "next_cursor": next_cursor})
+
+            elif method == "get_group_state":
+                gid = _require_str(params, "group_id")
+                g = node.groups.get(gid)
+                if not g:
+                    raise NodeError(f"unknown group_id {gid}")
+                state = g.chain.state
+                _ok(rid, {
+                    "group_id": gid,
+                    "height": g.chain.head.height,
+                    "head_block_id": g.chain.head.block_id,
+                    "last_block_ts_ms": g.chain.head.ts_ms,
+                    "member_count": len(state.members),
+                    "task_count": len(state.tasks),
+                    "presence_count": len(state.presence),
+                    "total_supply": state.total_supply,
+                })
+
             else:
                 _err(rid, "not_found", f"unknown method {method}")
         except MCPParamError as e:

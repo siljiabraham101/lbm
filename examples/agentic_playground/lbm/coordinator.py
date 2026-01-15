@@ -10,9 +10,16 @@ Architecture:
 - Agents are registered as members with unique identities
 - Claims are published by the coordinator on behalf of agents
 - No fork resolution needed - single source of truth
+
+Enhanced Features (v2):
+- Claim threading for conversations via parent_hash
+- Task management with state machine (pending → assigned → in_progress → completed/failed)
+- Agent presence tracking with stale detection
+- Time-windowed queries for "what's new" functionality
 """
 
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +39,7 @@ class AgentIdentity:
     role: str
     pub_key: str
     balance: int = 0
+    status: str = "active"  # active, idle, busy, offline
 
 
 @dataclass
@@ -42,7 +50,26 @@ class KnowledgeClaim:
     content: str
     tags: List[str]
     claim_hash: str
+    parent_hash: Optional[str] = None  # For threaded conversations
     timestamp: datetime = field(default_factory=datetime.now)
+    created_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+
+
+@dataclass
+class AgentTask:
+    """A task assigned to an agent."""
+    task_id: str
+    title: str
+    description: str
+    creator: str
+    assignee: Optional[str]
+    status: str  # pending, assigned, in_progress, completed, failed
+    reward: int
+    created_ms: int
+    started_ms: Optional[int] = None
+    completed_ms: Optional[int] = None
+    result_hash: Optional[str] = None
+    error_message: Optional[str] = None
 
 
 class LBMCoordinator:
@@ -176,6 +203,7 @@ class LBMCoordinator:
         content: str,
         claim_type: str = "insight",
         tags: Optional[List[str]] = None,
+        parent_hash: Optional[str] = None,
     ) -> KnowledgeClaim:
         """
         Share knowledge from an agent to the network.
@@ -185,6 +213,7 @@ class LBMCoordinator:
             content: The knowledge content
             claim_type: Type of claim (decision, code, review, insight, etc.)
             tags: Tags for categorization
+            parent_hash: Optional parent claim hash for threaded conversations
 
         Returns:
             KnowledgeClaim with the claim details
@@ -198,11 +227,15 @@ class LBMCoordinator:
         full_content = f"[{agent_name}:{claim_type}] {content}"
         all_tags = [agent.role, claim_type, f"author:{agent_name}"] + (tags or [])
 
-        # Publish claim from coordinator (single node, no forks)
+        # Publish claim with agent's own key (for proper reward attribution)
+        # Use parent_hash for threaded conversations
+        agent_keys = self._agent_keys.get(agent_name)
         claim_hash = self.node.publish_claim(
             self.group_id,
             text=full_content,
             tags=all_tags,
+            parent_hash=parent_hash,
+            signer_keys=agent_keys,
         )
 
         claim = KnowledgeClaim(
@@ -211,15 +244,46 @@ class LBMCoordinator:
             content=content,
             tags=all_tags,
             claim_hash=claim_hash,
+            parent_hash=parent_hash,
         )
 
         return claim
+
+    def reply_to_claim(
+        self,
+        agent_name: str,
+        parent_hash: str,
+        content: str,
+        claim_type: str = "answer",
+        tags: Optional[List[str]] = None,
+    ) -> KnowledgeClaim:
+        """
+        Reply to an existing claim (threaded conversation).
+
+        Args:
+            agent_name: Name of the agent replying
+            parent_hash: Hash of the claim being replied to
+            content: The reply content
+            claim_type: Type of claim (answer, followup, etc.)
+            tags: Additional tags
+
+        Returns:
+            KnowledgeClaim with the reply details
+        """
+        return self.share_knowledge(
+            agent_name=agent_name,
+            content=content,
+            claim_type=claim_type,
+            tags=tags,
+            parent_hash=parent_hash,
+        )
 
     def query_knowledge(
         self,
         agent_name: str,
         query: str,
         top_k: int = 8,
+        since_ms: Optional[int] = None,
     ) -> Tuple[str, List[str]]:
         """
         Query the knowledge base for relevant context.
@@ -228,6 +292,7 @@ class LBMCoordinator:
             agent_name: Name of the querying agent
             query: Search query
             top_k: Number of results
+            since_ms: Only include claims created after this timestamp (optional)
 
         Returns:
             Tuple of (compiled_context, claim_hashes)
@@ -236,7 +301,43 @@ class LBMCoordinator:
             raise ValueError(f"Unknown agent: {agent_name}")
 
         # Query from coordinator node (single source of truth)
-        return self.node.compile_context(self.group_id, query, top_k=top_k)
+        return self.node.compile_context(self.group_id, query, top_k=top_k, since_ms=since_ms)
+
+    def get_recent_claims(
+        self,
+        since_ms: int,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get recent claims since a timestamp.
+
+        Args:
+            since_ms: Only include claims created after this timestamp
+            limit: Maximum number of claims to return
+
+        Returns:
+            List of claim dictionaries with metadata
+        """
+        return self.node.get_recent_claims(self.group_id, since_ms, limit=limit)
+
+    def watch_for_updates(
+        self,
+        last_seen_ms: int,
+        limit: int = 50,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        Watch for new claims since last check (polling-based subscription).
+
+        Args:
+            last_seen_ms: Timestamp of last seen claim
+            limit: Maximum number of claims to return
+
+        Returns:
+            Tuple of (claims, next_cursor_ms)
+        """
+        claims = self.node.get_recent_claims(self.group_id, last_seen_ms, limit=limit)
+        next_cursor = max((c["created_ms"] for c in claims), default=last_seen_ms) + 1 if claims else last_seen_ms
+        return claims, next_cursor
 
     def get_agent_balance(self, agent_name: str) -> int:
         """Get an agent's token balance."""
@@ -257,7 +358,7 @@ class LBMCoordinator:
         Transfer tokens between agents.
 
         Args:
-            from_agent: Sending agent
+            from_agent: Sending agent (tokens will be transferred FROM this agent)
             to_agent: Receiving agent
             amount: Amount to transfer
 
@@ -270,11 +371,249 @@ class LBMCoordinator:
             raise ValueError(f"Unknown agent: {to_agent}")
 
         to_pub = self._agents[to_agent].pub_key
+        from_keys = self._agent_keys.get(from_agent)
 
-        # Note: In this simplified architecture, transfers are done by coordinator
-        # A more complete implementation would require agent-signed transactions
-        self.node.transfer(self.group_id, to_pub, amount)
+        # Transfer using the sending agent's keys for proper identity attribution
+        self.node.transfer(self.group_id, to_pub, amount, signer_keys=from_keys)
         return True
+
+    # =========================================================================
+    # Task Management
+    # =========================================================================
+
+    def create_task(
+        self,
+        creator_name: str,
+        task_id: str,
+        title: str,
+        description: str = "",
+        assignee_name: Optional[str] = None,
+        reward: int = 0,
+    ) -> AgentTask:
+        """
+        Create a new task for agents.
+
+        Args:
+            creator_name: Name of the agent creating the task
+            task_id: Unique task identifier
+            title: Task title
+            description: Task description
+            assignee_name: Optional agent to assign immediately
+            reward: Tokens to reward on completion
+
+        Returns:
+            AgentTask with task details
+        """
+        if creator_name not in self._agents:
+            raise ValueError(f"Unknown agent: {creator_name}")
+
+        assignee_pub = None
+        if assignee_name:
+            if assignee_name not in self._agents:
+                raise ValueError(f"Unknown assignee: {assignee_name}")
+            assignee_pub = self._agents[assignee_name].pub_key
+
+        self.node.create_task(
+            self.group_id,
+            task_id=task_id,
+            title=title,
+            description=description,
+            assignee=assignee_pub,
+            reward=reward,
+        )
+
+        tasks = self.node.get_tasks(self.group_id, status=None)
+        for t in tasks:
+            if t["task_id"] == task_id:
+                return AgentTask(
+                    task_id=t["task_id"],
+                    title=t["title"],
+                    description=t.get("description", ""),
+                    creator=creator_name,
+                    assignee=assignee_name,
+                    status=t["status"],
+                    reward=t.get("reward", 0),
+                    created_ms=t.get("created_ms", 0),
+                )
+
+        raise ValueError(f"Task creation failed for {task_id}")
+
+    def assign_task(
+        self,
+        task_id: str,
+        assignee_name: str,
+    ) -> None:
+        """
+        Assign a task to an agent.
+
+        Args:
+            task_id: Task to assign
+            assignee_name: Agent to assign to
+        """
+        if assignee_name not in self._agents:
+            raise ValueError(f"Unknown agent: {assignee_name}")
+
+        assignee_pub = self._agents[assignee_name].pub_key
+        self.node.assign_task(self.group_id, task_id, assignee_pub)
+
+    def start_task(self, agent_name: str, task_id: str) -> None:
+        """
+        Mark a task as started (in_progress).
+
+        Args:
+            agent_name: Agent starting the task (must be assignee)
+            task_id: Task to start
+        """
+        if agent_name not in self._agents:
+            raise ValueError(f"Unknown agent: {agent_name}")
+        agent_keys = self._agent_keys.get(agent_name)
+        self.node.start_task(self.group_id, task_id, signer_keys=agent_keys)
+
+    def complete_task(
+        self,
+        agent_name: str,
+        task_id: str,
+        result_hash: Optional[str] = None,
+    ) -> None:
+        """
+        Mark a task as completed.
+
+        Args:
+            agent_name: Agent completing the task (must be assignee)
+            task_id: Task to complete
+            result_hash: Optional hash of result artifact
+        """
+        if agent_name not in self._agents:
+            raise ValueError(f"Unknown agent: {agent_name}")
+        agent_keys = self._agent_keys.get(agent_name)
+        self.node.complete_task(self.group_id, task_id, result_hash=result_hash, signer_keys=agent_keys)
+
+    def fail_task(
+        self,
+        agent_name: str,
+        task_id: str,
+        error_message: str = "",
+    ) -> None:
+        """
+        Mark a task as failed.
+
+        Args:
+            agent_name: Agent failing the task (must be assignee)
+            task_id: Task that failed
+            error_message: Reason for failure
+        """
+        if agent_name not in self._agents:
+            raise ValueError(f"Unknown agent: {agent_name}")
+        agent_keys = self._agent_keys.get(agent_name)
+        self.node.fail_task(self.group_id, task_id, error_message=error_message, signer_keys=agent_keys)
+
+    def get_tasks(
+        self,
+        status: Optional[str] = None,
+        assignee_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get tasks with optional filtering.
+
+        Args:
+            status: Filter by status (pending, assigned, in_progress, completed, failed)
+            assignee_name: Filter by assignee agent name
+
+        Returns:
+            List of task dictionaries
+        """
+        assignee_pub = None
+        if assignee_name:
+            if assignee_name not in self._agents:
+                raise ValueError(f"Unknown agent: {assignee_name}")
+            assignee_pub = self._agents[assignee_name].pub_key
+
+        tasks = self.node.get_tasks(self.group_id, status=status, assignee=assignee_pub)
+
+        # Enrich with agent names
+        pub_to_name = {a.pub_key: name for name, a in self._agents.items()}
+        for t in tasks:
+            if t.get("assignee") and t["assignee"] in pub_to_name:
+                t["assignee_name"] = pub_to_name[t["assignee"]]
+            if t.get("creator") and t["creator"] in pub_to_name:
+                t["creator_name"] = pub_to_name[t["creator"]]
+
+        return tasks
+
+    def get_agent_tasks(self, agent_name: str) -> List[Dict[str, Any]]:
+        """Get all tasks assigned to an agent."""
+        return self.get_tasks(assignee_name=agent_name)
+
+    # =========================================================================
+    # Agent Presence
+    # =========================================================================
+
+    def update_presence(
+        self,
+        agent_name: str,
+        status: str = "active",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Update an agent's presence status.
+
+        Args:
+            agent_name: Agent to update
+            status: Status (active, idle, busy, offline)
+            metadata: Optional metadata (e.g., current task, capabilities)
+        """
+        if agent_name not in self._agents:
+            raise ValueError(f"Unknown agent: {agent_name}")
+
+        self._agents[agent_name].status = status
+        agent_keys = self._agent_keys.get(agent_name)
+        self.node.update_presence(self.group_id, status, metadata=metadata, signer_keys=agent_keys)
+
+    def get_presence(
+        self,
+        stale_threshold_ms: int = 300000,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Get presence status of all agents.
+
+        Args:
+            stale_threshold_ms: Consider agents stale after this time (default 5 min)
+
+        Returns:
+            Dict of pub_key -> presence info
+        """
+        presence = self.node.get_presence(self.group_id, stale_threshold_ms=stale_threshold_ms)
+
+        # Enrich with agent names
+        pub_to_name = {a.pub_key: name for name, a in self._agents.items()}
+        enriched = {}
+        for pub_key, info in presence.items():
+            if pub_key in pub_to_name:
+                info["agent_name"] = pub_to_name[pub_key]
+            enriched[pub_key] = info
+
+        return enriched
+
+    def get_active_agents(
+        self,
+        stale_threshold_ms: int = 300000,
+    ) -> List[str]:
+        """
+        Get list of currently active (non-stale) agents.
+
+        Args:
+            stale_threshold_ms: Consider agents stale after this time
+
+        Returns:
+            List of active agent names
+        """
+        presence = self.get_presence(stale_threshold_ms=stale_threshold_ms)
+        active = []
+        for pub_key, info in presence.items():
+            if not info.get("is_stale", True) and info.get("status") != "offline":
+                if "agent_name" in info:
+                    active.append(info["agent_name"])
+        return active
 
     def get_stats(self) -> Dict[str, Any]:
         """Get coordination statistics."""
@@ -292,6 +631,21 @@ class LBMCoordinator:
             if tx.get("type") == "claim"
         )
 
+        # Count tasks by status
+        all_tasks = self.get_tasks()
+        task_stats = {
+            "total": len(all_tasks),
+            "pending": sum(1 for t in all_tasks if t["status"] == "pending"),
+            "assigned": sum(1 for t in all_tasks if t["status"] == "assigned"),
+            "in_progress": sum(1 for t in all_tasks if t["status"] == "in_progress"),
+            "completed": sum(1 for t in all_tasks if t["status"] == "completed"),
+            "failed": sum(1 for t in all_tasks if t["status"] == "failed"),
+        }
+
+        # Get presence info
+        presence = self.get_presence()
+        active_agents = self.get_active_agents()
+
         return {
             "project_name": self.project_name,
             "group_id": self.group_id,
@@ -300,9 +654,12 @@ class LBMCoordinator:
             "treasury_balance": stats["treasury_balance"],
             "claim_count": claim_count,
             "agent_count": len(self._agents),
+            "active_agent_count": len(active_agents),
+            "tasks": task_stats,
             "agents": {
                 name: {
                     "role": agent.role,
+                    "status": agent.status,
                     "balance": self.get_agent_balance(name),
                 }
                 for name, agent in self._agents.items()

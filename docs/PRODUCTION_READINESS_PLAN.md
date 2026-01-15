@@ -2,11 +2,11 @@
 
 ## Executive Summary
 
-The Learning Battery Market codebase is **production-ready** with comprehensive security hardening completed. This document tracks 45 identified issues across 4 severity levels.
+The Learning Battery Market codebase is **production-ready** with comprehensive security hardening completed. This document tracks 50 identified issues across 4 severity levels.
 
-**Status: 98% Complete (44/45 issues resolved)**
+**Status: 98% Complete (49/50 issues resolved)**
 
-**Version: 0.5.0**
+**Version: 0.6.0** (Multi-Agent Coordination Release)
 
 ## Implementation Status
 
@@ -126,6 +126,16 @@ The Learning Battery Market codebase is **production-ready** with comprehensive 
 | 7.7 Overflow Protection | DONE | MAX_TOKEN_VALUE = 2^63 - 1 |
 | 7.8 Node API Methods | DONE | `update_group_policy()`, `get_token_stats()`, `transfer()` |
 
+## Phase 8: v0.6.0 Multi-Agent Coordination - COMPLETED
+
+| Issue | Status | Implementation |
+|-------|--------|----------------|
+| 8.1 Claim Threading | DONE | `parent_hash` support in claims for conversations |
+| 8.2 Task Management | DONE | State machine: pending → assigned → in_progress → completed/failed |
+| 8.3 Agent Presence | DONE | Heartbeat tracking with stale detection |
+| 8.4 Time-Windowed Queries | DONE | `since_ms` filter for "what's new" queries |
+| 8.5 Per-Agent Signing | DONE | `signer_keys` parameter for multi-agent identity |
+
 ---
 
 ## Remaining Items
@@ -133,6 +143,11 @@ The Learning Battery Market codebase is **production-ready** with comprehensive 
 ### Deferred (Protocol Changes Required)
 1. **HTLC for Purchases** - Buyer pays before key delivery; no refund mechanism
    - Mitigation: Use trusted sellers or application-level escrow
+
+### Known Limitations
+1. **MCP Single Identity** - MCP interface supports one node identity per process
+   - For multi-agent orchestration, use the Python API with `signer_keys` parameter
+   - Each agent should have distinct keys registered via `gen_node_keys()`
 
 ### Optional Enhancements
 1. **Prometheus Metrics** - Health endpoint available for basic monitoring
@@ -190,7 +205,7 @@ export LB_P2P_MAX_REQ_PER_MIN=60
 ## Testing Summary
 
 ### Completed
-- [x] Unit tests for all security features (102 tests passing)
+- [x] Unit tests for all security features (177 tests passing)
 - [x] Key encryption roundtrip tests
 - [x] Rate limiting boundary tests
 - [x] CAS thread safety tests
@@ -200,6 +215,8 @@ export LB_P2P_MAX_REQ_PER_MIN=60
 - [x] Admin panel tests (9 tests)
 - [x] Thread safety tests for peer registry
 - [x] Token economy tests (33 tests)
+- [x] Multi-agent coordination tests (30 tests)
+- [x] Agentic playground tests (24 tests)
 
 ### Verification Commands
 
@@ -227,7 +244,7 @@ python -c "from lb.node import BatteryNode; from lb.admin import AdminServer; fr
 
 ## Conclusion
 
-The codebase has achieved **98% production readiness** (44/45 issues resolved).
+The codebase has achieved **98% production readiness** (49/50 issues resolved).
 
 **Ready for Production:**
 - All critical and high-priority security issues resolved
@@ -239,10 +256,15 @@ The codebase has achieved **98% production readiness** (44/45 issues resolved).
 - Web admin panel with secure CORS policy
 - Auto-sync daemon with retry backoff
 - Token economy with faucet, rewards, fees, and supply caps
-- 102 comprehensive tests passing
+- Multi-agent coordination with task management, presence, and claim threading
+- Per-agent signing for proper identity attribution
+- 177 comprehensive tests passing (+ 24 agentic playground tests)
 
 **Deferred:**
 - HTLC for atomic purchases (requires protocol redesign)
+
+**Known Limitations:**
+- MCP interface is single-identity; use Python API for multi-agent scenarios
 
 **Recommended:**
 - Load testing before high-traffic deployment

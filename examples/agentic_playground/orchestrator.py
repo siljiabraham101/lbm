@@ -7,11 +7,18 @@ The Orchestrator is the "meta-agent" that:
 3. Coordinates agent activities
 4. Manages the overall workflow
 5. Persists learnings through LBM
+
+Enhanced Features (v2):
+- Task-based coordination with state machine
+- Agent presence monitoring
+- Time-aware progress tracking
+- Threaded conversations for discussions
 """
 
 import asyncio
 import json
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,7 +31,7 @@ except ImportError:
 
 from .agents.factory import AgentFactory
 from .agents.base import BaseAgent
-from .lbm.coordinator import LBMCoordinator
+from .lbm.coordinator import LBMCoordinator, AgentTask
 
 
 @dataclass
@@ -35,6 +42,7 @@ class ProjectPlan:
     phases: List[Dict[str, Any]]
     estimated_tasks: int
     created_at: datetime
+    task_ids: List[str] = field(default_factory=list)  # Track created task IDs
 
 
 class Orchestrator:
@@ -132,6 +140,8 @@ When creating plans, use this JSON structure:
         self._plan: Optional[ProjectPlan] = None
         self._agents: Dict[str, BaseAgent] = {}
         self._completed_tasks: List[Dict[str, Any]] = []
+        self._task_counter: int = 0
+        self._start_time_ms: int = int(time.time() * 1000)
 
     async def analyze_goal(self, goal: str) -> ProjectPlan:
         """
@@ -269,9 +279,47 @@ Consider:
 
         return team
 
+    def _generate_task_id(self, prefix: str = "task") -> str:
+        """Generate a unique task ID."""
+        self._task_counter += 1
+        return f"{prefix}_{self._task_counter:04d}"
+
+    async def create_phase_tasks(
+        self,
+        phase: Dict[str, Any],
+        agent_name: str,
+    ) -> List[str]:
+        """
+        Create LBM tasks for a phase.
+
+        Args:
+            phase: Phase definition with tasks
+            agent_name: Agent to assign tasks to
+
+        Returns:
+            List of created task IDs
+        """
+        phase_name = phase.get("name", "Unnamed Phase")
+        tasks = phase.get("tasks", [])
+        task_ids = []
+
+        for task_desc in tasks:
+            task_id = self._generate_task_id(phase_name.lower().replace(" ", "_")[:10])
+            self.coordinator.create_task(
+                creator_name="Orchestrator",
+                task_id=task_id,
+                title=task_desc,
+                description=f"Phase: {phase_name}",
+                assignee_name=agent_name,
+                reward=10,  # Reward per task completion
+            )
+            task_ids.append(task_id)
+
+        return task_ids
+
     async def run_phase(self, phase: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Execute a single phase of the plan.
+        Execute a single phase of the plan using task-based coordination.
 
         Args:
             phase: Phase definition with agent and tasks
@@ -299,26 +347,75 @@ Consider:
         print(f"Tasks: {len(tasks)}")
         print("="*60)
 
+        # Create LBM tasks for this phase
+        task_ids = await self.create_phase_tasks(phase, agent.config.name)
+        print(f"  Created {len(task_ids)} tasks in LBM")
+
+        # Update agent presence
+        await agent.update_presence("busy", metadata={"phase": phase_name})
+
         results = []
-        for task in tasks:
-            print(f"\n  Task: {task}")
-            result = await agent.execute_task(task)
-            results.append({
-                "task": task,
-                "result": result,
-                "agent": agent.config.name,
-            })
+        for i, task_desc in enumerate(tasks):
+            task_id = task_ids[i]
+            print(f"\n  [{task_id}] {task_desc}")
+
+            # Start task in LBM
+            await agent.start_task(task_id)
+            print(f"    Status: in_progress")
+
+            try:
+                # Execute the task
+                result = await agent.execute_task(task_desc)
+
+                # Share a finding as the result
+                finding_hash = await agent.share_insight(
+                    f"Completed: {task_desc}",
+                    claim_type="task_result",
+                    tags=["task", phase_name.lower().replace(" ", "-")],
+                )
+
+                # Complete task in LBM with result hash
+                await agent.complete_task(task_id, result_hash=finding_hash)
+                print(f"    Status: completed ✓")
+
+                results.append({
+                    "task_id": task_id,
+                    "task": task_desc,
+                    "result": result,
+                    "result_hash": finding_hash,
+                    "agent": agent.config.name,
+                    "status": "completed",
+                })
+            except Exception as e:
+                # Mark task as failed
+                await agent.fail_task(task_id, error_message=str(e))
+                print(f"    Status: failed ✗ ({e})")
+
+                results.append({
+                    "task_id": task_id,
+                    "task": task_desc,
+                    "error": str(e),
+                    "agent": agent.config.name,
+                    "status": "failed",
+                })
+
             self._completed_tasks.append({
                 "phase": phase_name,
-                "task": task,
+                "task_id": task_id,
+                "task": task_desc,
                 "agent": agent.config.name,
                 "completed_at": datetime.now().isoformat(),
             })
 
+        # Update agent presence back to active
+        await agent.update_presence("active")
+
         return {
             "phase": phase_name,
             "agent": agent.config.name,
-            "tasks_completed": len(results),
+            "tasks_completed": sum(1 for r in results if r.get("status") == "completed"),
+            "tasks_failed": sum(1 for r in results if r.get("status") == "failed"),
+            "task_ids": task_ids,
             "results": results,
         }
 
@@ -368,14 +465,28 @@ Consider:
         print(f"  Claims: {stats['claim_count']}")
         print(f"  Total Tokens: {stats['total_supply']}")
 
-        print(f"\nAgent Balances:")
+        print(f"\nTask Summary:")
+        task_stats = stats.get("tasks", {})
+        print(f"  Total: {task_stats.get('total', 0)}")
+        print(f"  Completed: {task_stats.get('completed', 0)}")
+        print(f"  Failed: {task_stats.get('failed', 0)}")
+
+        print(f"\nAgent Status:")
         for name, info in stats.get("agents", {}).items():
-            print(f"  - {name}: {info['balance']} tokens")
+            print(f"  - {name}: {info['balance']} tokens ({info.get('status', 'unknown')})")
+
+        # Show active agents
+        active = self.coordinator.get_active_agents()
+        print(f"\nActive Agents: {', '.join(active) if active else 'None'}")
 
         # Export learnings
         learnings_file = self.work_dir / "learnings.json"
         self.coordinator.export_learnings(learnings_file)
         print(f"\nLearnings exported to: {learnings_file}")
+
+        # Calculate elapsed time
+        elapsed_ms = int(time.time() * 1000) - self._start_time_ms
+        elapsed_s = elapsed_ms / 1000
 
         return {
             "goal": goal,
@@ -385,16 +496,25 @@ Consider:
             },
             "results": phase_results,
             "stats": stats,
+            "elapsed_seconds": elapsed_s,
             "learnings_file": str(learnings_file),
         }
 
     def get_progress(self) -> Dict[str, Any]:
-        """Get current progress."""
+        """Get current progress including task and presence info."""
+        stats = self.coordinator.get_stats()
         return {
             "plan": self._plan.__dict__ if self._plan else None,
             "agents": self.factory.get_team_status(),
             "completed_tasks": self._completed_tasks,
-            "stats": self.coordinator.get_stats(),
+            "active_agents": self.coordinator.get_active_agents(),
+            "tasks": {
+                "total": stats.get("tasks", {}).get("total", 0),
+                "in_progress": stats.get("tasks", {}).get("in_progress", 0),
+                "completed": stats.get("tasks", {}).get("completed", 0),
+                "failed": stats.get("tasks", {}).get("failed", 0),
+            },
+            "stats": stats,
         }
 
     def get_knowledge_summary(self) -> List[Dict[str, Any]]:

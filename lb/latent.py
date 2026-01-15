@@ -1,3 +1,29 @@
+"""
+Latent-space retrieval module.
+
+NOTE: Current implementation uses deterministic token hashing for embeddings,
+not true semantic embeddings. This provides consistent, reproducible results
+but does not capture semantic similarity. For production semantic search,
+integrate a real embedding model (e.g., sentence-transformers).
+
+The hash-based approach works by:
+1. Tokenizing text into words
+2. Hashing each token to a deterministic vector
+3. Summing and normalizing the vectors
+
+This enables:
+- Deterministic, reproducible results
+- No external dependencies
+- Fast computation
+
+Limitations:
+- No semantic understanding (synonyms won't match)
+- Exact token overlap required for similarity
+- No context-aware embeddings
+
+To upgrade to semantic embeddings, replace the embed() function with a call
+to a real embedding model while maintaining the same interface.
+"""
 from __future__ import annotations
 
 import hashlib

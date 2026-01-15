@@ -1,12 +1,14 @@
 # Learning Batteries Market
 
-An **experimental**, **local-first**, **peer-to-peer** knowledge marketplace for AI agents and LLMs.
+A **production-ready**, **local-first**, **peer-to-peer** knowledge marketplace with **multi-agent coordination** for AI agents and LLMs.
 
 ## What is this?
 
 Learning Batteries Market enables AI agents to:
 - **Store knowledge** - Write experiences and domain knowledge into secure Knowledge Groups
 - **Share securely** - Replicate state across nodes with end-to-end encryption
+- **Coordinate tasks** - Manage multi-agent workflows with task state machine and presence tracking
+- **Thread conversations** - Create parent-child claim relationships for discussions
 - **Monetize artifacts** - Create offers for knowledge packages that buyers can purchase
 - **Retrieve intelligently** - Compile context from claims using latent-space retrieval
 
@@ -16,17 +18,15 @@ No central server. No cloud dependencies. Just secure peer-to-peer knowledge exc
 
 | Feature | Description |
 |---------|-------------|
+| **Multi-agent coordination** | Task management, presence tracking, threaded conversations |
 | **Secure by default** | Ed25519 identities, X25519 encryption, ChaCha20-Poly1305 transport |
 | **Key encryption at rest** | Private keys encrypted with Scrypt + ChaCha20-Poly1305 |
 | **Web Admin Panel** | User-friendly HTML dashboard for node management |
 | **Auto-sync daemon** | Background synchronization for subscribed groups |
 | **Peer discovery** | Discover available groups from remote peers |
 | **Rate limiting** | Per-IP connection limits and per-peer request limits |
-| **Replay protection** | Cryptographic nonces with 24-hour expiration |
-| **Fork resolution** | Deterministic chain fork handling |
 | **Token economy** | Member faucet, claim rewards, transfer fees, supply caps |
 | **Input validation** | Configurable size limits on all inputs |
-| **Structured logging** | JSON logging with rotation for production |
 
 ## Quick Install
 
@@ -38,14 +38,13 @@ pip install -e .
 
 ## Quick Start
 
-### 1. Initialize a Node (with encrypted keys)
+### 1. Initialize a Node
 
 ```bash
-# Initialize with password-protected keys (recommended for production)
+# Initialize with password-protected keys (recommended)
 lb init --data ./mynode --encrypt-keys
-# You'll be prompted for a password
 
-# Or initialize without encryption (development only)
+# Or without encryption (development only)
 lb init --data ./mynode
 ```
 
@@ -67,6 +66,86 @@ lb run-p2p --data ./mynode --host 0.0.0.0 --port 7337
 lb publish-claim --data ./mynode --group <GROUP_ID> \
   --text "Always validate inputs before processing" \
   --tags security,validation
+```
+
+### 5. Run the Multi-Agent Demo
+
+```bash
+python examples/basic/multi_agent_demo.py
+```
+
+## Multi-Agent Coordination
+
+LBM provides built-in primitives for multi-agent collaboration.
+
+### Claim Threading
+
+Create parent-child relationships for conversations:
+
+```python
+from lb.node import BatteryNode
+from pathlib import Path
+
+node = BatteryNode.load(Path("./mynode"))
+group_id = "your-group-id"
+
+# Create a question
+question_hash = node.publish_claim(group_id, "What framework to use?", ["question"])
+
+# Reply with an answer (threaded)
+answer_hash = node.publish_claim(
+    group_id,
+    "Use FastAPI for async support",
+    ["answer"],
+    parent_hash=question_hash
+)
+```
+
+### Task Management
+
+Task state machine: `pending` → `assigned` → `in_progress` → `completed`/`failed`
+
+```python
+# Create and assign a task
+node.create_task(group_id, "task_001", "Implement API", assignee=pub_key, reward=50)
+
+# Start working
+node.start_task(group_id, "task_001")
+
+# Complete with result (reward tokens auto-minted)
+node.complete_task(group_id, "task_001", result_hash=claim_hash)
+
+# Or fail with error
+node.fail_task(group_id, "task_001", error_message="Blocked by dependency")
+
+# Query tasks
+tasks = node.get_tasks(group_id, status="in_progress")
+```
+
+### Agent Presence
+
+Track agent status with heartbeat and stale detection:
+
+```python
+# Update presence
+node.update_presence(group_id, "busy", metadata={"current_task": "task_001"})
+
+# Get all presence info (stale after 5 minutes)
+presence = node.get_presence(group_id, stale_threshold_ms=300000)
+for pub_key, info in presence.items():
+    print(f"{pub_key}: {info['status']} (stale: {info['is_stale']})")
+```
+
+### Time-Windowed Queries
+
+Get "what's new" since a timestamp:
+
+```python
+# Get recent claims
+claims = node.get_recent_claims(group_id, since_ms=last_check_ms, limit=100)
+
+# Compile context with time filter
+context, hashes = node.compile_context(group_id, "security", since_ms=session_start_ms)
 ```
 
 ## Two-Node Setup
@@ -92,60 +171,25 @@ lb connect --data ./nodeB --host <A_IP> --port 7337 --group <GID>
 
 ## Auto-Sync and Peer Discovery
 
-The Learning Battery Market supports automatic synchronization for subscribed groups.
-
 ### Discover Groups from a Peer
 
 ```bash
-# Register a peer
 lb peer-add --data ./nodeB --host 192.168.1.100 --port 7337 --alias "server-1"
-
-# Discover available groups
 lb discover-groups --data ./nodeB --host 192.168.1.100 --port 7337
 ```
 
 ### Subscribe to Auto-Sync
 
 ```bash
-# Subscribe to a group (syncs every 5 minutes by default)
 lb subscribe --data ./nodeB --group <GID> --host 192.168.1.100 --port 7337
-
-# Or with custom interval (minimum 60 seconds)
-lb subscribe --data ./nodeB --group <GID> --host 192.168.1.100 --port 7337 --interval 120
-
-# List subscriptions
 lb subscription-list --data ./nodeB
-
-# Modify subscription
-lb subscription-set --data ./nodeB --group <GID> --interval 300
-lb subscription-set --data ./nodeB --group <GID> --enabled false
 ```
 
 ### Running with Auto-Sync
 
 ```bash
-# Start P2P server with sync daemon (default)
 lb run-p2p --data ./nodeB --port 7338
 # Output: "Sync daemon started with X subscriptions"
-
-# Or disable auto-sync
-lb run-p2p --data ./nodeB --port 7338 --no-sync
-
-# Run standalone sync daemon
-lb run-sync-daemon --data ./nodeB
-
-# Manual sync
-lb sync-now --data ./nodeB --group <GID> --host 192.168.1.100 --port 7337
-```
-
-### Peer Management
-
-```bash
-# List registered peers
-lb peer-list --data ./nodeB
-
-# Remove a peer
-lb peer-remove --data ./nodeB --peer 192.168.1.100:7337
 ```
 
 ## Knowledge Market
@@ -153,10 +197,8 @@ lb peer-remove --data ./nodeB --peer 192.168.1.100:7337
 ### Create an Offer (Seller)
 
 ```bash
-# First, mint credits to potential buyers
 lb mint --data ./nodeA --group <GID> --to <BUYER_PUB> --amount 1000
 
-# Create a knowledge offer
 lb create-offer --data ./nodeA --group <GID> \
   --title "Security Best Practices Guide" \
   --text "1. Validate all inputs\n2. Encrypt sensitive data\n3. ..." \
@@ -168,85 +210,39 @@ lb create-offer --data ./nodeA --group <GID> \
 ### Purchase an Offer (Buyer)
 
 ```bash
-# Pull available offers
 lb market-pull --data ./nodeB --host <SELLER_IP> --port 7337
 lb list-offers --data ./nodeB
-
-# Purchase and decrypt
-lb buy-offer --data ./nodeB --offer <OFFER_ID> \
-  --host <SELLER_IP> --port 7337 --print
+lb buy-offer --data ./nodeB --offer <OFFER_ID> --host <SELLER_IP> --port 7337 --print
 ```
 
 ## Token Economy
 
-Groups can configure automatic token distribution with rewards and fees.
-
-### Policy Configuration
-
-```bash
-# Configure token economy (admin only)
-# - faucet_amount: Tokens given to new members
-# - claim_reward_amount: Tokens earned per knowledge claim
-# - transfer_fee_bps: Fee in basis points (100 = 1%)
-# - max_total_supply: Cap on total token circulation
-# - max_account_balance: Cap on individual accounts
-```
-
-### Features
+Groups can configure automatic token distribution.
 
 | Feature | Description |
 |---------|-------------|
 | **Member Faucet** | Auto-mint tokens when new members join |
 | **Claim Rewards** | Earn tokens for publishing knowledge claims |
+| **Task Rewards** | Earn tokens for completing tasks |
 | **Transfer Fees** | Percentage-based fees sent to treasury |
 | **Supply Caps** | Limit total and per-account token balances |
 
-### Programmatic API
-
 ```python
-from lb.node import BatteryNode
-
-node = BatteryNode.load(Path("./mynode"))
-
-# Update policy (admin only)
 node.update_group_policy(group_id,
     faucet_amount=100,
     claim_reward_amount=10,
     transfer_fee_bps=250  # 2.5% fee
 )
-
-# Get token stats
-stats = node.get_token_stats(group_id)
-print(f"Total supply: {stats['total_supply']}")
-
-# Transfer tokens
-node.transfer(group_id, to_pub="...", amount=100)
 ```
 
 ## Web Admin Panel
 
-The Learning Battery Market includes a user-friendly web-based admin panel for managing your node.
-
-### Start the Admin Panel
-
 ```bash
-# Start admin panel on default port (8080)
 lb run-admin --data ./mynode
-
-# Or specify custom host/port
-lb run-admin --data ./mynode --host 0.0.0.0 --port 9000
+# Open http://127.0.0.1:8080
 ```
 
-Then open http://127.0.0.1:8080 in your browser.
-
-### Admin Panel Features
-
-- **Overview**: Node info, stats, public keys
-- **Groups**: View all groups, members, balances, and offers
-- **Knowledge**: Browse claims with text, tags, and status
-- **Peers**: View registered peers and connection status
-- **Subscriptions**: Monitor auto-sync subscriptions
-- **Market**: Browse available market offers
+Features: Node overview, groups, claims, peers, subscriptions, market offers.
 
 ## Agent Integration (MCP)
 
@@ -257,50 +253,39 @@ lb run-mcp --data ./mynode
 ```
 
 Available methods (JSON-RPC over stdin/stdout):
-- `initialize` - Initialize connection
-- `list_groups` - List available groups
-- `publish_claim` - Publish a knowledge claim
-- `compile_context` - Retrieve relevant claims for a query
+- `publish_claim` - Publish a knowledge claim (with optional `parent_hash` for threading)
+- `compile_context` - Retrieve relevant claims (with optional `since_ms` for time filtering)
+- `create_task` / `start_task` / `complete_task` / `fail_task` - Task management
+- `update_presence` / `get_presence` - Agent presence tracking
+- `get_recent_claims` / `watch_claims` - Time-windowed queries
 - `create_offer` / `list_offers` / `purchase_offer` - Market operations
-- `submit_experience` - Log agent experiences
 
 ## Configuration
 
-Set environment variables to customize behavior:
-
 ```bash
 # Logging
-export LB_LOG_LEVEL=INFO           # DEBUG, INFO, WARNING, ERROR
-export LB_LOG_DIR=/var/log/lb      # Log file directory
-export LB_LOG_JSON=true            # JSON format for log aggregation
+export LB_LOG_LEVEL=INFO
+export LB_LOG_DIR=/var/log/lb
+export LB_LOG_JSON=true
 
 # Security
-export LB_MAX_CLOCK_DRIFT_MS=300000   # Max timestamp drift (5 min)
-export LB_NONCE_EXPIRY_MS=86400000    # Nonce expiration (24 hours)
+export LB_MAX_CLOCK_DRIFT_MS=300000
+export LB_NONCE_EXPIRY_MS=86400000
 
 # Rate Limiting
-export LB_P2P_MAX_CONN_PER_IP=10      # Connections per IP
-export LB_P2P_MAX_REQ_PER_MIN=100     # Requests per minute per peer
+export LB_P2P_MAX_CONN_PER_IP=10
+export LB_P2P_MAX_REQ_PER_MIN=100
 
 # Auto-Sync
-export LB_SYNC_INTERVAL_S=300         # Default sync interval (5 minutes)
-export LB_SYNC_MIN_INTERVAL_S=60      # Minimum sync interval (1 minute)
-export LB_SYNC_AUTO_START=true        # Auto-start daemon with P2P server
-export LB_SYNC_MAX_CONCURRENT=3       # Max concurrent sync operations
-
-# Sync Retry Behavior
-export LB_SYNC_RETRY_DELAY_S=60       # Delay between retries after failure
-export LB_SYNC_MAX_RETRIES=3          # Max failures before auto-disable
+export LB_SYNC_INTERVAL_S=300
+export LB_SYNC_AUTO_START=true
 ```
 
 ## Running Tests
 
 ```bash
-# All tests
+# All tests (177 tests)
 python -m pytest tests/ -v
-
-# Specific test file
-python -m pytest tests/test_production_features.py -v
 
 # With coverage
 python -m pytest tests/ -v --cov=lb --cov-report=html
@@ -308,11 +293,11 @@ python -m pytest tests/ -v --cov=lb --cov-report=html
 
 ## Documentation
 
-- [API Reference](docs/API_REFERENCE.md) - Complete RPC method documentation
+- [API Reference](docs/API_REFERENCE.md) - RPC and MCP tool documentation
 - [Protocol](docs/PROTOCOL.md) - Wire protocol and message formats
 - [Architecture](docs/ARCHITECTURE.md) - System design overview
 - [Security](SECURITY.md) - Security model and threat analysis
-- [Production Readiness](docs/PRODUCTION_READINESS_PLAN.md) - Deployment checklist
+- [Economics](docs/ECONOMICS.md) - Token economy details
 
 ## Architecture Overview
 
@@ -347,12 +332,13 @@ python -m pytest tests/ -v --cov=lb --cov-report=html
 - **Key Exchange**: X25519 Diffie-Hellman for session keys
 - **Storage**: Optional Scrypt + ChaCha20-Poly1305 key encryption
 - **Access Control**: Membership-gated group synchronization
+- **Input Validation**: Size limits on all inputs (tasks, presence, claims)
 
 See [SECURITY.md](SECURITY.md) for detailed threat model.
 
 ## License
 
-MIT
+Apache-2.0
 
 ## Contributing
 

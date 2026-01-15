@@ -14,10 +14,11 @@ class Claim:
     tags: List[str]
     created_ms: int
     evidence: List[str]
+    parent_hash: Optional[str] = None  # For claim threading/conversations
     retracted: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "claim_hash": self.claim_hash,
             "text": self.text,
             "tags": list(self.tags),
@@ -25,6 +26,9 @@ class Claim:
             "evidence": list(self.evidence),
             "retracted": bool(self.retracted),
         }
+        if self.parent_hash is not None:
+            d["parent_hash"] = self.parent_hash
+        return d
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Claim":
@@ -34,6 +38,7 @@ class Claim:
             tags=list(d.get("tags", [])),
             created_ms=int(d.get("created_ms", 0)),
             evidence=list(d.get("evidence", [])),
+            parent_hash=d.get("parent_hash"),  # Optional threading
             retracted=bool(d.get("retracted", False)),
         )
 
@@ -52,7 +57,16 @@ class ContextGraph:
         self.claims: Dict[str, Claim] = {}
         self._embedding_cache: Dict[str, List[float]] = {}  # claim_hash -> embedding
 
-    def add_claim(self, claim_hash: str, text: str, tags: List[str], evidence: Optional[List[str]] = None, *, created_ms: Optional[int] = None) -> None:
+    def add_claim(
+        self,
+        claim_hash: str,
+        text: str,
+        tags: List[str],
+        evidence: Optional[List[str]] = None,
+        *,
+        created_ms: Optional[int] = None,
+        parent_hash: Optional[str] = None,
+    ) -> None:
         if created_ms is None:
             created_ms = int(time.time() * 1000)
         self.claims[claim_hash] = Claim(
@@ -61,6 +75,7 @@ class ContextGraph:
             tags=list(tags),
             created_ms=int(created_ms),
             evidence=list(evidence or []),
+            parent_hash=parent_hash,
             retracted=False,
         )
         # Pre-compute and cache embedding for O(1) lookup during compile
@@ -73,11 +88,26 @@ class ContextGraph:
             # Remove from embedding cache to free memory
             self._embedding_cache.pop(claim_hash, None)
 
-    def compile(self, query: str, *, top_k: int = 8) -> Tuple[str, List[str]]:
+    def compile(
+        self, query: str, *, top_k: int = 8, since_ms: Optional[int] = None
+    ) -> Tuple[str, List[str]]:
+        """Compile context slice from claims.
+
+        Args:
+            query: Search query for similarity ranking
+            top_k: Number of results to return
+            since_ms: Only include claims created after this timestamp (optional)
+
+        Returns:
+            Tuple of (formatted context string, list of claim hashes)
+        """
         qv = embed(query)
         scored: List[Tuple[float, str]] = []
         for h, c in self.claims.items():
             if c.retracted:
+                continue
+            # Time filter: skip claims older than since_ms
+            if since_ms is not None and c.created_ms < since_ms:
                 continue
             # Use cached embedding if available, otherwise compute and cache
             if h in self._embedding_cache:

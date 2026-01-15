@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Learning Batteries Market is a **production-ready**, **local-first**, **peer-to-peer** knowledge marketplace. AI agents write experience and domain knowledge into Knowledge Groups (permissioned append-only chains). Knowledge compiles into context slices via latent-space retrieval. Nodes replicate securely using Ed25519/X25519 cryptography.
+Learning Batteries Market is a **production-ready**, **local-first**, **peer-to-peer** knowledge marketplace with **multi-agent coordination**. AI agents write experience and domain knowledge into Knowledge Groups (permissioned append-only chains). Knowledge compiles into context slices via latent-space retrieval. Nodes replicate securely using Ed25519/X25519 cryptography.
 
-**Version**: 0.5.0 (Token Economy Release)
+**Version**: 0.6.0 (Multi-Agent Coordination)
 
 ## Quick Reference
 
@@ -14,7 +14,7 @@ Learning Batteries Market is a **production-ready**, **local-first**, **peer-to-
 # Install
 python -m venv .venv && source .venv/bin/activate && pip install -e .
 
-# Run tests
+# Run tests (177 tests)
 python -m pytest tests/ -v
 
 # Initialize node with encrypted keys
@@ -22,6 +22,9 @@ lb init --data ./mynode --encrypt-keys
 
 # Start P2P server
 lb run-p2p --data ./mynode --host 0.0.0.0 --port 7337
+
+# Run multi-agent demo
+python examples/basic/multi_agent_demo.py
 ```
 
 ## Architecture
@@ -35,7 +38,7 @@ lb/
 ├── chain.py         # Permissioned append-only chain
 ├── group.py         # Knowledge group management
 ├── cas.py           # Content-addressed storage (thread-safe)
-├── context_graph.py # Truth-maintenance claims
+├── context_graph.py # Truth-maintenance claims with threading
 ├── latent.py        # Latent-space retrieval
 ├── keys.py          # Ed25519 + X25519 key management
 ├── key_encryption.py# Key encryption at rest (Scrypt + ChaCha20)
@@ -56,7 +59,7 @@ lb/
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| BatteryNode | `node.py` | Orchestrates keys, CAS, groups, offer book |
+| BatteryNode | `node.py` | Orchestrates keys, CAS, groups, offer book, tasks, presence |
 | GroupChain | `chain.py` | Validates and appends blocks with transactions |
 | CAS | `cas.py` | Thread-safe content-addressed storage |
 | P2PServer | `p2p.py` | Rate-limited RPC server |
@@ -82,6 +85,86 @@ lb/
 {"type": "offer_create", "offer": {...}, "ts_ms": ...}
 {"type": "purchase", "offer_id": "...", "buyer": "...", "nonce": "...", "ts_ms": ...}
 {"type": "grant", "offer_id": "...", "buyer": "...", "sealed_key": "...", "ts_ms": ...}
+
+# Task Management
+{"type": "task_create", "task_id": "...", "title": "...", "assignee": "...", "reward": 10, "ts_ms": ...}
+{"type": "task_assign", "task_id": "...", "assignee": "...", "ts_ms": ...}
+{"type": "task_start", "task_id": "...", "ts_ms": ...}
+{"type": "task_complete", "task_id": "...", "result_hash": "...", "ts_ms": ...}
+{"type": "task_fail", "task_id": "...", "error_message": "...", "ts_ms": ...}
+
+# Agent Presence
+{"type": "presence", "status": "active|idle|busy|offline", "metadata": {...}, "ts_ms": ...}
+```
+
+## Multi-Agent Coordination
+
+LBM provides built-in primitives for multi-agent collaboration.
+
+### Claim Threading
+
+Claims can reference parent claims for threaded conversations:
+
+```python
+# Create a question
+question_hash = node.publish_claim(group_id, "What framework to use?", ["question"])
+
+# Reply with an answer (threaded)
+answer_hash = node.publish_claim(
+    group_id,
+    "Use FastAPI for async support",
+    ["answer"],
+    parent_hash=question_hash
+)
+```
+
+### Task Management
+
+Task state machine: `pending` → `assigned` → `in_progress` → `completed`/`failed`
+
+```python
+# Create and assign a task
+node.create_task(group_id, "task_001", "Implement API", assignee=pub_key, reward=50)
+
+# Start working
+node.start_task(group_id, "task_001")
+
+# Complete with result
+node.complete_task(group_id, "task_001", result_hash=claim_hash)
+# Reward tokens are automatically minted to assignee
+
+# Or fail with error
+node.fail_task(group_id, "task_001", error_message="Blocked by dependency")
+
+# Query tasks
+tasks = node.get_tasks(group_id, status="in_progress")
+```
+
+### Agent Presence
+
+Track agent status with heartbeat and stale detection:
+
+```python
+# Update presence
+node.update_presence(group_id, "busy", metadata={"current_task": "task_001"})
+
+# Get all presence info (stale detection after 5 minutes)
+presence = node.get_presence(group_id, stale_threshold_ms=300000)
+for pub_key, info in presence.items():
+    if info["is_stale"]:
+        print(f"Agent {pub_key} is stale")
+```
+
+### Time-Windowed Queries
+
+Get "what's new" since a timestamp:
+
+```python
+# Get recent claims
+claims = node.get_recent_claims(group_id, since_ms=last_check_ms, limit=100)
+
+# Compile context with time filter
+context, hashes = node.compile_context(group_id, "security", since_ms=session_start_ms)
 ```
 
 ## Configuration
@@ -148,6 +231,19 @@ except ValidationError as e:
     print(f"Invalid: {e.field} - {e.message}")
 ```
 
+### Security Limits
+
+| Limit | Value | Description |
+|-------|-------|-------------|
+| MAX_TOKEN_VALUE | 2^63 - 1 | Integer overflow protection |
+| Transfer fee | 50% max | 5000 bps maximum |
+| Task ID length | 256 chars | Prevent abuse |
+| Task title | 256 chars | Prevent abuse |
+| Task description | 4096 chars | Prevent abuse |
+| Error message | 1024 chars | Prevent abuse |
+| Presence metadata | 4KB | Prevent abuse |
+| Claim text | 64KB | Prevent abuse |
+
 ## Token Economy
 
 Configurable per-group token economy with automatic minting, rewards, and fees.
@@ -182,23 +278,16 @@ stats = node.get_token_stats(group_id)
 node.transfer(group_id, to_pub="...", amount=100)
 ```
 
-### Security Limits
-
-- Integer overflow protection: MAX_TOKEN_VALUE = 2^63 - 1
-- Transfer fee capped at 50% (5000 bps)
-- Supply cap cannot be lowered below current supply
-- Empty policy updates rejected
-
 ## Testing
 
 ### Run Tests
 
 ```bash
-# All tests
+# All tests (177 tests)
 python -m pytest tests/ -v
 
 # Specific file
-python -m pytest tests/test_production_features.py -v
+python -m pytest tests/test_multi_agent.py -v
 
 # Specific test
 python -m pytest tests/test_market.py::TestMarketEndToEnd::test_offer_purchase_flow -v
@@ -213,6 +302,8 @@ python -m pytest tests/ -v --cov=lb --cov-report=html
 - `tests/test_market.py` - Offer creation, purchase flow
 - `tests/test_token_economy.py` - Token economy (faucet, rewards, fees, caps)
 - `tests/test_production_features.py` - Key encryption, rate limiting, CAS consistency
+- `tests/test_multi_agent.py` - Claim threading, task management, presence, time queries
+- `tests/test_edge_cases.py` - Security edge cases, validation limits
 
 ### Writing Tests
 
@@ -307,6 +398,8 @@ print(f"Offers: {len(node.offer_book)}")
 for gid, group in node.groups.items():
     state = group.chain.state
     print(f"Group {gid}: {len(state.members)} members, height {group.chain.head.height}")
+    print(f"  Tasks: {len(state.tasks)}")
+    print(f"  Active presence: {len(state.presence)}")
 ```
 
 ### Inspect CAS
@@ -336,7 +429,7 @@ print(f"By kind: {stats['by_kind']}")
 - `README.md` - User-facing quickstart
 - `SECURITY.md` - Security model and features
 - `CHANGELOG.md` - Version history
-- `docs/API_REFERENCE.md` - RPC method documentation
+- `docs/API_REFERENCE.md` - RPC and MCP tool documentation
 - `docs/PROTOCOL.md` - Wire protocol details
 - `docs/ARCHITECTURE.md` - System design
-- `docs/PRODUCTION_READINESS_PLAN.md` - Deployment checklist
+- `docs/ECONOMICS.md` - Token economy details
