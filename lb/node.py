@@ -291,7 +291,7 @@ class BatteryNode:
             
         new_groups_ids = []
         # Create a set of already loaded paths for O(1) lookup
-        loaded_paths = {g.chain.path.resolve() for g in self.groups.values()}
+        loaded_paths = {g.root.resolve() for g in self.groups.values()}
 
         for p in self.groups_dir.iterdir():
             if not p.is_dir() or not (p / "chain.json").exists():
