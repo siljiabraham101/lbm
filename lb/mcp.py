@@ -204,7 +204,7 @@ TOOLS = [
     },
     {
         "name": "record_thought",
-        "description": "Log a component of reasoning (goal, hypothesis, observation, reflection). Use this to 'think out loud' without explicit user command.",
+        "description": "CRITICAL: You MUST use this tool to log your internal reasoning process (goal, hypothesis, observation, reflection) before providing a final answer. This creates a permanent thought stream.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -215,6 +215,22 @@ TOOLS = [
             },
             "required": ["group_id", "content"]
         }
+    }
+]
+
+# --- Prompts Definition ---
+
+PROMPTS = [
+    {
+        "name": "thought_stream",
+        "description": "Activates the friction-less reasoning capture mode. Injects system instructions for the Thought Stream Protocol.",
+        "arguments": [
+            {
+                "name": "group_id",
+                "description": "The Group ID to store thought logs in (default: myaimemory)",
+                "required": False
+            }
+        ]
     }
 ]
 
@@ -361,7 +377,8 @@ def run_mcp(
                 response = {
                     "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": {
-                        "tools": {} # We provide tools
+                        "tools": {},    # We provide tools
+                        "prompts": {},  # We provide prompts
                     },
                     "serverInfo": {
                         "name": "lbm-mcp-server",
@@ -394,6 +411,47 @@ def run_mcp(
                         "isError": True,
                         "content": [{"type": "text", "text": f"Error executing {name}: {str(e)}"}]
                     })
+
+            # --- Prompt Discovery ---
+            elif method == "prompts/list":
+                _ok(rid, {"prompts": PROMPTS})
+
+            elif method == "prompts/get":
+                pname = params.get("name")
+                pargs = params.get("arguments", {})
+                
+                if pname == "thought_stream":
+                    gid = pargs.get("group_id", "myaimemory")
+                    # Construct the PromptMessage
+                    # MCP Prompt structure: { "description": "...", "messages": [ { "role": "user", "content": { "type": "text", "text": "..." } } ] }
+                    # Wait, prompts/get returns GetPromptResult which has `messages` and `description` (optional).
+                    
+                    sys_prompt = f"""# LBM THOUGHT STREAM PROTOCOL
+You are connected to a Personal Knowledge Mesh via MCP.
+Your goal is to capture your reasoning process PERMANENTLY without user intervention.
+
+**CRITICAL RULE:**
+Before providing ANY final answer or performing a complex task, you MUST use the `record_thought` tool to log your internal state.
+
+Use `group_id` = "{gid}" (or the relevant project group).
+
+**Thinking Types:**
+- `goal`: What are you trying to achieve?
+- `hypothesis`: How do you plan to solve it?
+- `action`: What tool are you finding/using?
+- `observation`: What did you find?
+- `reflection`: Did it work? What did you learn?
+"""
+                    _ok(rid, {
+                        "messages": [
+                            {
+                                "role": "user", 
+                                "content": {"type": "text", "text": sys_prompt} 
+                            }
+                        ]
+                    })
+                else:
+                    _err(rid, -32601, f"Prompt not found: {pname}")
 
             # --- Ping/Std methods ---
             elif method == "ping":
