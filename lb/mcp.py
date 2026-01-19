@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import hashlib
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 
@@ -200,8 +201,25 @@ TOOLS = [
             },
             "required": ["group_id"]
         }
+    },
+    {
+        "name": "record_thought",
+        "description": "Log a component of reasoning (goal, hypothesis, observation, reflection). Use this to 'think out loud' without explicit user command.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string", "description": "Group ID to store the thought stream"},
+                "content": {"type": "string", "description": " The thought content"},
+                "thought_type": {"type": "string", "enum": ["goal", "hypothesis", "action", "observation", "reflection"], "default": "reflection"},
+                "context_id": {"type": "string", "description": "Optional session ID to link thoughts. If not provided, one is generated per agent session."}
+            },
+            "required": ["group_id", "content"]
+        }
     }
 ]
+
+# Simple in-memory session tracking for thought streams
+_thought_sessions: Dict[str, str] = {}  # agent_name -> current_context_id
 
 def handle_tool_call(node: BatteryNode, name: str, args: Dict[str, Any]) -> Any:
     """Execute the tool logic."""
@@ -219,6 +237,35 @@ def handle_tool_call(node: BatteryNode, name: str, args: Dict[str, Any]) -> Any:
             parent_hash=args.get("parent_hash")
         )
         return {"claim_hash": h, "status": "published"}
+
+    elif name == "record_thought":
+        gid = args["group_id"]
+        if gid not in node.groups:
+             raise NodeError(f"Node is not a member of group {gid}")
+
+        # Manage tags automatically
+        ttype = args.get("thought_type", "reflection")
+        tags = ["#thought", f"#{ttype}"]
+        
+        # Link to session
+        # We don't have agent_name easily available here in handle_tool_call signature
+        # But we can pass context_id if the client provided it, or just use a generic one
+        cid = args.get("context_id")
+        if cid:
+            tags.append(f"ctx:{cid}")
+            
+        params = {
+            "type": ttype,
+            "content": args["content"],
+            "ts": int(time.time() * 1000)
+        }
+        
+        # Publish as a structured claim (JSON string as text for now)
+        text_payload = json.dumps(params)
+        
+        h = node.publish_claim(gid, text_payload, tags)
+        logger.debug(f"Recorded thought: {ttype} in {gid}")
+        return {"claim_hash": h, "status": "recorded"}
 
     elif name == "compile_context":
         gid = args["group_id"]
