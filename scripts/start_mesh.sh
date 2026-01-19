@@ -12,7 +12,8 @@ SCREEN_SESSION="lbm_mesh"
 
 # Detect Node Directory
 # If running on Mac Mini (Hub), use local ./node if checking from repo, or explicit path
-if [[ "$(hostname)" == *"Mac-Mini"* ]]; then
+HOST_LOWER=$(hostname | tr '[:upper:]' '[:lower:]')
+if [[ "$HOST_LOWER" == *"mac-mini"* ]]; then
     # Hub Configuration
     DATA_ARG="--data $LBM_DIR/node"
     P2P_PORT=7337
