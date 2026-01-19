@@ -129,6 +129,13 @@ class CryptoConfig:
 
 
 @dataclass
+class DiscoveryConfig:
+    """Configuration for mDNS/ZeroConf discovery."""
+    
+    enabled: bool = field(default_factory=lambda: _env_bool("LB_DISCOVERY_ENABLED", True))
+
+
+@dataclass
 class SyncConfig:
     """Configuration for sync daemon and auto-sync."""
 
@@ -162,6 +169,7 @@ class Config:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     crypto: CryptoConfig = field(default_factory=CryptoConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
+    discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
@@ -182,6 +190,7 @@ class Config:
             logging=LoggingConfig(**d.get("logging", {})) if d.get("logging") else LoggingConfig(),
             crypto=CryptoConfig(**d.get("crypto", {})) if d.get("crypto") else CryptoConfig(),
             sync=SyncConfig(**d.get("sync", {})) if d.get("sync") else SyncConfig(),
+            discovery=DiscoveryConfig(**d.get("discovery", {})) if d.get("discovery") else DiscoveryConfig(),
         )
 
     @classmethod

@@ -5,6 +5,7 @@ import time
 from typing import Any, Dict, Optional, List
 
 from .node import BatteryNode
+from .discovery import DiscoveryService
 from .secure_channel import server_handshake, client_handshake, HandshakeError, SecureSession
 from .wire import read_frame, write_frame
 from .keys import b64e, b64d
@@ -42,12 +43,19 @@ class P2PServer:
         self._shutdown_event: Optional[asyncio.Event] = None
         self._active_connections: int = 0
         self._connections_lock = asyncio.Lock()
+        self._discovery: Optional[DiscoveryService] = None
 
     async def start(self, host: str, port: int) -> None:
         self._shutdown_event = asyncio.Event()
         self._server = await asyncio.start_server(self._handle, host, port)
         addr = self._server.sockets[0].getsockname() if self._server.sockets else (host, port)
         logger.info(f"P2P server started on {addr[0]}:{addr[1]}")
+
+        # Start Discovery
+        config = get_config()
+        if config.discovery.enabled:
+            self._discovery = DiscoveryService(self.node, port)
+            await self._discovery.start()
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -65,6 +73,11 @@ class P2PServer:
             return
 
         logger.info("Initiating graceful shutdown...")
+
+        # Stop Discovery
+        if self._discovery:
+            await self._discovery.stop()
+            self._discovery = None
 
         # Stop accepting new connections
         self._server.close()

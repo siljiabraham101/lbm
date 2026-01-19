@@ -12,6 +12,7 @@ license = {text = "Apache-2.0"}
 authors = [{name="Anoop + GPT", email="devnull@example.com"}]
 dependencies = [
   "cryptography>=41.0.0",
+  "zeroconf>=0.131.0",
 ]
 
 [project.scripts]
