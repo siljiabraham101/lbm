@@ -117,6 +117,12 @@ class SyncDaemon:
 
     async def _check_and_sync(self) -> None:
         """Check all subscriptions and sync those that are due."""
+        # Hot-reload groups just in case new ones were created via CLI
+        try:
+            self.node.refresh_groups()
+        except Exception as e:
+            logger.warning(f"Error refreshing groups: {e}")
+
         now_ms = _now_ms()
         due_subs = self.registry.list_due_subscriptions(now_ms)
 

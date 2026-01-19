@@ -280,6 +280,41 @@ class BatteryNode:
                 g = Group.load(p)
                 self.groups[g.group_id] = g
 
+    def refresh_groups(self) -> List[str]:
+        """Scan groups directory and load any new groups.
+        
+        Returns:
+            List of newly loaded group IDs.
+        """
+        if not self.groups_dir.exists():
+            return []
+            
+        new_groups_ids = []
+        # Create a set of already loaded paths for O(1) lookup
+        loaded_paths = {g.chain.path.resolve() for g in self.groups.values()}
+
+        for p in self.groups_dir.iterdir():
+            if not p.is_dir() or not (p / "chain.json").exists():
+                continue
+            
+            if p.resolve() in loaded_paths:
+                continue
+
+            try:
+                g = Group.load(p)
+                # Check for ID collision just in case
+                if g.group_id in self.groups:
+                    continue
+
+                self.groups[g.group_id] = g
+                new_groups_ids.append(g.group_id)
+                logger.info(f"Hot-loaded new group: {g.group_id} from {p.name}")
+            except Exception as e:
+                logger.error(f"Failed to hot-load group from {p.name}: {e}")
+                
+        return new_groups_ids
+
+
     def _load_offer_book(self) -> None:
         if self.offer_book_path.exists():
             self.offer_book = read_json(self.offer_book_path)
