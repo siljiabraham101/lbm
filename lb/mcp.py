@@ -1,48 +1,10 @@
 """
 MCP (Model Context Protocol) interface for Learning Battery Market.
 
-This module provides a JSON-RPC over stdin/stdout interface for AI agent
-integration. It allows agents to publish claims, query context, manage tasks,
-and interact with the knowledge market.
+This module implements a standard MCP server over request/response JSON-RPC (stdin/stdout).
+It allows AI agents (like Claude Code) to interact with the LBM node as a set of tools.
 
-GitHub Integration
-==================
-The MCP interface supports automatic detection of .lbm/ directories in
-the working directory. When detected, it will:
-- Use the repository's LBM configuration
-- Load the node from .lbm/node/
-- Auto-register the agent if agent_auto_register is enabled
-
-This enables seamless integration when agents (Claude Code, Codex, etc.)
-are started in a repository with LBM initialized.
-
-Example:
-    # In a repo with .lbm/, pass working_dir to enable GitHub integration
-    run_mcp(data_dir="/path/to/node", working_dir="/path/to/repo")
-
-IMPORTANT: Single Identity Limitation
-=====================================
-The MCP interface operates with the identity of the node it's connected to.
-All operations (claims, tasks, presence) are signed by the node's key.
-
-For multi-agent scenarios where each agent needs a distinct identity:
-- Use the Python API directly with the `signer_keys` parameter
-- Generate per-agent keys via `gen_node_keys()`
-- Pass agent keys to methods like `publish_claim()`, `start_task()`, etc.
-
-Example multi-agent setup (Python API):
-    from lb.keys import gen_node_keys
-    from lb.node import BatteryNode
-
-    node = BatteryNode.load(data_dir)
-    agent_keys = gen_node_keys()
-    node.add_member(group_id, agent_keys.sign_pub_b64, role="member")
-    node.publish_claim(group_id, "content", ["tags"], signer_keys=agent_keys)
-
-The MCP interface is best suited for:
-- Single-agent integrations
-- GitHub-integrated repos with auto-registration
-- Centralized coordinator patterns where one identity manages all operations
+See: https://modelcontextprotocol.io/
 """
 from __future__ import annotations
 
@@ -51,8 +13,9 @@ import base64
 import json
 import os
 import sys
+import hashlib
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 
 from . import __version__
 from .node import BatteryNode, NodeError
@@ -60,6 +23,8 @@ from .logging_config import get_logger
 
 logger = get_logger("lb.mcp")
 
+# MCP Protocol Version
+MCP_PROTOCOL_VERSION = "2024-11-05"
 
 class MCPParamError(Exception):
     """Error for missing or invalid MCP parameters."""
@@ -68,58 +33,29 @@ class MCPParamError(Exception):
         super().__init__(f"{field} {message}")
 
 
-def _require(params: Dict[str, Any], field: str) -> Any:
-    """Get a required parameter, raising MCPParamError if missing."""
-    if field not in params:
-        raise MCPParamError(field)
-    return params[field]
-
-
-def _require_str(params: Dict[str, Any], field: str) -> str:
-    """Get a required string parameter."""
-    value = _require(params, field)
-    if not isinstance(value, str):
-        raise MCPParamError(field, "must be a string")
-    return value
-
-
-def _require_int(params: Dict[str, Any], field: str) -> int:
-    """Get a required integer parameter."""
-    value = _require(params, field)
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        raise MCPParamError(field, "must be an integer")
-
-
 def _ok(rid: Any, result: Any) -> None:
-    sys.stdout.write(json.dumps({"id": rid, "result": result, "error": None}, ensure_ascii=False) + "\n")
+    """Send a successful JSON-RPC response."""
+    if rid is None: return  # Notification, no response
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
 
-def _err(rid: Any, code: str, message: str) -> None:
-    sys.stdout.write(json.dumps({"id": rid, "result": None, "error": {"code": code, "message": message}}, ensure_ascii=False) + "\n")
+def _err(rid: Any, code: int, message: str, data: Any = None) -> None:
+    """Send a JSON-RPC error response."""
+    if rid is None: return  # Notification, no response
+    err = {"code": code, "message": message}
+    if data:
+        err["data"] = data
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": rid, "error": err}, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
 
 def _detect_lbm_repo(working_dir: Optional[str] = None) -> Optional[Path]:
-    """Detect .lbm/ directory in working directory or current directory.
-
-    Args:
-        working_dir: Explicit working directory to check. If None, uses cwd.
-
-    Returns:
-        Path to repo root if .lbm/ found, None otherwise.
-    """
+    """Detect .lbm/ directory in working directory or current directory."""
     check_dirs = []
-
     if working_dir:
         check_dirs.append(Path(working_dir).resolve())
-
-    # Also check current working directory
     check_dirs.append(Path.cwd())
-
-    # Check environment variable for repo path
     if env_repo := os.environ.get("LBM_REPO_PATH"):
         check_dirs.append(Path(env_repo).resolve())
 
@@ -127,7 +63,6 @@ def _detect_lbm_repo(working_dir: Optional[str] = None) -> Optional[Path]:
         lbm_dir = d / ".lbm"
         if lbm_dir.exists() and (lbm_dir / "config.json").exists():
             return d
-
     return None
 
 
@@ -136,22 +71,10 @@ def _load_node_for_mcp(
     working_dir: Optional[str] = None,
     agent_name: Optional[str] = None,
 ) -> tuple:
-    """Load node for MCP, with optional GitHub integration.
-
-    Args:
-        data_dir: Standard node data directory
-        working_dir: Working directory to check for .lbm/
-        agent_name: Optional agent name for auto-registration
-
-    Returns:
-        Tuple of (node, config_info) where config_info is None for standard nodes
-        or dict with GitHub integration info.
-    """
-    # Check for .lbm/ directory
+    """Load node for MCP, with optional GitHub integration."""
     repo_path = _detect_lbm_repo(working_dir)
 
     if repo_path:
-        # Use GitHub-integrated node
         try:
             from .github_integration import (
                 is_lbm_initialized,
@@ -159,39 +82,203 @@ def _load_node_for_mcp(
                 get_or_create_node,
                 register_agent,
             )
-
             if is_lbm_initialized(repo_path):
                 config = load_lbm_config(repo_path)
                 node = get_or_create_node(repo_path)
-
                 config_info = {
                     "github_integration": True,
                     "github_repo": config.github_repo,
                     "group_id": config.group_id,
                     "group_name": config.group_name,
-                    "agent_auto_register": config.agent_auto_register,
                 }
-
                 logger.info(f"MCP using GitHub-integrated node for {config.github_repo}")
-
+                
                 # Auto-register agent if enabled
                 if config.agent_auto_register and agent_name:
                     try:
                         agent_info = register_agent(repo_path, agent_name, agent_type="mcp")
                         config_info["agent_registered"] = True
-                        config_info["agent_pub"] = agent_info["sign_pub"]
                         logger.info(f"Auto-registered MCP agent: {agent_name}")
                     except Exception as e:
                         logger.warning(f"Failed to auto-register agent: {e}")
-
                 return node, config_info
         except Exception as e:
             logger.warning(f"Failed to load GitHub-integrated node: {e}")
-            # Fall through to standard loading
 
-    # Standard node loading
     node = BatteryNode.load(data_dir)
     return node, None
+
+
+# --- Tools Definition ---
+
+TOOLS = [
+    {
+        "name": "publish_claim",
+        "description": "Publish knowledge, ideas, or observations to the knowledge graph. Use this to save important information.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string", "description": "The Group ID to publish to"},
+                "text": {"type": "string", "description": "The content of the claim"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for classification"},
+                "parent_hash": {"type": "string", "description": "Optional hash of a parent claim to thread this under"}
+            },
+            "required": ["group_id", "text"]
+        }
+    },
+    {
+        "name": "compile_context",
+        "description": "Retrieve relevant knowledge from the graph based on a query. Use this to answer questions using stored knowledge.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string", "description": "The Group ID to query"},
+                "query": {"type": "string", "description": "The search query"},
+                "top_k": {"type": "integer", "description": "Number of results to return (default 8)"},
+                "since_ms": {"type": "integer", "description": "Only return claims newer than this timestamp (ms)"}
+            },
+            "required": ["group_id", "query"]
+        }
+    },
+    {
+        "name": "list_groups",
+        "description": "List all knowledge groups this node is a member of.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        }
+    },
+    {
+        "name": "create_task",
+        "description": "Create a new task in the system.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string"},
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "assignee": {"type": "string", "description": "Public key of assignee (optional)"},
+                "reward": {"type": "integer", "description": "Token reward amount"}
+            },
+            "required": ["group_id", "title"]
+        }
+    },
+    {
+        "name": "list_tasks",
+        "description": "List tasks in a group, optionally filtered by status or assignee.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["pending", "assigned", "in_progress", "completed", "failed"]},
+                "assignee": {"type": "string"}
+            },
+            "required": ["group_id"]
+        }
+    },
+    {
+        "name": "complete_task",
+        "description": "Mark a task as completed, optionally linking to a result claim.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "result_hash": {"type": "string", "description": "Hash of the claim containing the result"}
+            },
+            "required": ["group_id", "task_id"]
+        }
+    },
+    {
+        "name": "get_recent_claims",
+        "description": "Get a list of the most recent claims in a group.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string"},
+                "limit": {"type": "integer", "description": "Max claims to return (default 20)"}
+            },
+            "required": ["group_id"]
+        }
+    }
+]
+
+def handle_tool_call(node: BatteryNode, name: str, args: Dict[str, Any]) -> Any:
+    """Execute the tool logic."""
+    
+    if name == "publish_claim":
+        gid = args["group_id"]
+        # Auto-subscribe if not subscribed? No, explicit subscription preferred.
+        if gid not in node.groups:
+             raise NodeError(f"Node is not a member of group {gid}")
+             
+        h = node.publish_claim(
+            gid, 
+            args["text"], 
+            args.get("tags", []), 
+            parent_hash=args.get("parent_hash")
+        )
+        return {"claim_hash": h, "status": "published"}
+
+    elif name == "compile_context":
+        gid = args["group_id"]
+        text, hashes = node.compile_context(
+            gid, 
+            args["query"], 
+            top_k=args.get("top_k", 8),
+            since_ms=args.get("since_ms")
+        )
+        return {"context": text, "source_claims": hashes}
+
+    elif name == "list_groups":
+        groups = []
+        for gid, g in node.groups.items():
+            groups.append({
+                "group_id": gid, 
+                "name": g.chain.state.policy.name,
+                "head_height": g.chain.head.height
+            })
+        return {"groups": groups}
+
+    elif name == "create_task":
+        # Generate random task ID if not provided (MCP doesn't strictly need one from user)
+        # But node.create_task requires one. Let's start with a random one.
+        task_id = hashlib.sha256(os.urandom(32)).hexdigest()[:16]
+        node.create_task(
+            args["group_id"], 
+            task_id, 
+            args["title"], 
+            description=args.get("description", ""),
+            assignee=args.get("assignee"), 
+            reward=args.get("reward", 0)
+        )
+        return {"task_id": task_id, "status": "created"}
+
+    elif name == "list_tasks":
+        tasks = node.get_tasks(
+            args["group_id"], 
+            status=args.get("status"), 
+            assignee=args.get("assignee")
+        )
+        return {"tasks": tasks}
+
+    elif name == "complete_task":
+        node.complete_task(
+            args["group_id"], 
+            args["task_id"], 
+            result_hash=args.get("result_hash")
+        )
+        return {"status": "completed"}
+
+    elif name == "get_recent_claims":
+        claims = node.get_recent_claims(
+            args["group_id"], 
+            since_ms=0, 
+            limit=args.get("limit", 20)
+        )
+        return {"claims": claims}
+
+    raise ValueError(f"Unknown tool: {name}")
 
 
 def run_mcp(
@@ -199,221 +286,75 @@ def run_mcp(
     working_dir: Optional[str] = None,
     agent_name: Optional[str] = None,
 ) -> None:
-    """Run the MCP (Model Context Protocol) interface.
-
-    Args:
-        data_dir: Node data directory path
-        working_dir: Optional working directory to check for .lbm/ integration
-        agent_name: Optional agent name for auto-registration (when in GitHub repo)
-
-    The MCP interface reads JSON-RPC requests from stdin and writes responses
-    to stdout. When a .lbm/ directory is detected in the working directory,
-    it automatically uses the repository's LBM configuration.
-    """
-    # Generate default agent name if not provided
+    """Run the MCP loop."""
     if not agent_name:
         agent_name = f"mcp-{os.getpid()}"
 
     node, config_info = _load_node_for_mcp(data_dir, working_dir, agent_name)
 
+    # Main Loop
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
+        
         try:
             req = json.loads(line)
-        except Exception as e:
-            _err(None, "bad_json", str(e))
+        except json.JSONDecodeError:
+            _err(None, -32700, "Parse error")
             continue
 
         rid = req.get("id")
         method = req.get("method")
-        params = req.get("params") or {}
+        params = req.get("params", {})
 
         try:
+            # --- MCP Handshake ---
             if method == "initialize":
                 response = {
-                    "node_id": node.node_id,
-                    "sign_pub": node.keys.sign_pub_b64,
-                    "enc_pub": node.keys.enc_pub_b64,
-                    "version": __version__,
-                }
-                # Include GitHub integration info if available
-                if config_info:
-                    response["github_integration"] = {
-                        "enabled": True,
-                        "github_repo": config_info.get("github_repo"),
-                        "group_id": config_info.get("group_id"),
-                        "group_name": config_info.get("group_name"),
-                        "agent_registered": config_info.get("agent_registered", False),
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {
+                        "tools": {} # We provide tools
+                    },
+                    "serverInfo": {
+                        "name": "lbm-mcp-server",
+                        "version": __version__
                     }
+                }
                 _ok(rid, response)
-            elif method == "list_groups":
-                gs = []
-                for gid, g in node.groups.items():
-                    gs.append({"group_id": gid, "name": g.chain.state.policy.name, "currency": g.chain.state.policy.currency})
-                _ok(rid, {"groups": gs})
-            elif method == "publish_claim":
-                gid = params["group_id"]
-                text = params["text"]
-                tags = list(params.get("tags", []))
-                parent_hash = params.get("parent_hash")  # Optional threading
-                h = node.publish_claim(gid, text, tags, parent_hash=parent_hash)
-                _ok(rid, {"claim_hash": h})
-            elif method == "retract_claim":
-                node.retract_claim(params["group_id"], params["claim_hash"])
-                _ok(rid, {"ok": True})
-            elif method == "submit_experience":
-                gid = params["group_id"]
-                exp = params.get("experience", {}) or {}
-                h = node.submit_experience(gid, exp)
-                _ok(rid, {"experience_hash": h})
-            elif method == "compile_context":
-                gid = params["group_id"]
-                q = params["query"]
-                top_k = int(params.get("top_k", 8))
-                since_ms = params.get("since_ms")  # Optional time filter
-                if since_ms is not None:
-                    since_ms = int(since_ms)
-                text, chosen = node.compile_context(gid, q, top_k=top_k, since_ms=since_ms)
-                _ok(rid, {"context": text, "claim_hashes": chosen})
-            elif method == "create_offer":
-                gid = params["group_id"]
-                title = params["title"]
-                text = params["text"]
-                price = int(params["price"])
-                tags = list(params.get("tags", []))
-                host = str(params.get("announce_host", "127.0.0.1"))
-                port = int(params.get("announce_port", 0))
-                offer_id, package_hash = node.create_offer(gid, title=title, text=text, price=price, tags=tags, announce_host=host, announce_port=port)
-                _ok(rid, {"offer_id": offer_id, "package_hash": package_hash})
-            elif method == "list_offers":
-                _ok(rid, {"offers": [o.to_dict() for o in node.list_offers()]})
-            elif method == "market_pull":
-                host = params["host"]
-                port = int(params["port"])
-                n = asyncio.run(node.pull_market_offers_from_peer(host, port))
-                _ok(rid, {"imported": n})
-            elif method == "sync_group":
-                host = params["host"]
-                port = int(params["port"])
-                gid = params["group_id"]
-                replaced = asyncio.run(node.sync_group_from_peer(host, port, gid))
-                _ok(rid, {"replaced": replaced})
-            elif method == "purchase_offer":
-                host = params["host"]
-                port = int(params["port"])
-                offer_id = params["offer_id"]
-                package_hash, pt = asyncio.run(node.purchase_offer_from_peer(host=host, port=port, offer_id=offer_id))
-                # attempt to decode json package
+
+            elif method == "notifications/initialized":
+                # Client acknowledging initialization
+                # No response needed for notifications
+                pass
+
+            # --- Tool Discovery ---
+            elif method == "tools/list":
+                _ok(rid, {"tools": TOOLS})
+
+            # --- Tool Execution ---
+            elif method == "tools/call":
+                name = params.get("name")
+                args = params.get("arguments", {})
+                
                 try:
-                    pkg = json.loads(pt.decode("utf-8"))
-                except Exception:
-                    pkg = {"raw_b64": base64.b64encode(pt).decode("ascii")}
-                _ok(rid, {"package_hash": package_hash, "package": pkg})
+                    result = handle_tool_call(node, name, args)
+                    _ok(rid, {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]})
+                except Exception as e:
+                    # Tool errors should be returned as text content usually, or specific error codes
+                    # MCP spec allows isUserError property
+                    _ok(rid, {
+                        "isError": True,
+                        "content": [{"type": "text", "text": f"Error executing {name}: {str(e)}"}]
+                    })
 
-            # ========== Task Management ==========
-            elif method == "create_task":
-                gid = _require_str(params, "group_id")
-                task_id = _require_str(params, "task_id")
-                title = _require_str(params, "title")
-                description = params.get("description", "")
-                assignee = params.get("assignee")
-                due_ms = int(params["due_ms"]) if params.get("due_ms") else None
-                reward = int(params.get("reward", 0))
-                node.create_task(gid, task_id, title, description=description, assignee=assignee, due_ms=due_ms, reward=reward)
-                _ok(rid, {"task_id": task_id})
-
-            elif method == "assign_task":
-                gid = _require_str(params, "group_id")
-                task_id = _require_str(params, "task_id")
-                assignee = _require_str(params, "assignee")
-                node.assign_task(gid, task_id, assignee)
-                _ok(rid, {"ok": True})
-
-            elif method == "start_task":
-                gid = _require_str(params, "group_id")
-                task_id = _require_str(params, "task_id")
-                node.start_task(gid, task_id)
-                _ok(rid, {"ok": True})
-
-            elif method == "complete_task":
-                gid = _require_str(params, "group_id")
-                task_id = _require_str(params, "task_id")
-                result_hash = params.get("result_hash")
-                node.complete_task(gid, task_id, result_hash=result_hash)
-                _ok(rid, {"ok": True})
-
-            elif method == "fail_task":
-                gid = _require_str(params, "group_id")
-                task_id = _require_str(params, "task_id")
-                error_message = params.get("error_message", "")
-                node.fail_task(gid, task_id, error_message=error_message)
-                _ok(rid, {"ok": True})
-
-            elif method == "list_tasks":
-                gid = _require_str(params, "group_id")
-                status = params.get("status")
-                assignee = params.get("assignee")
-                tasks = node.get_tasks(gid, status=status, assignee=assignee)
-                _ok(rid, {"tasks": tasks})
-
-            # ========== Agent Presence ==========
-            elif method == "update_presence":
-                gid = _require_str(params, "group_id")
-                status = params.get("status", "active")
-                metadata = params.get("metadata")
-                node.update_presence(gid, status, metadata=metadata)
-                _ok(rid, {"ok": True})
-
-            elif method == "get_presence":
-                gid = _require_str(params, "group_id")
-                stale_threshold_ms = int(params.get("stale_threshold_ms", 300000))
-                presence = node.get_presence(gid, stale_threshold_ms=stale_threshold_ms)
-                _ok(rid, {"presence": presence})
-
-            # ========== Time-Windowed Queries ==========
-            elif method == "get_recent_claims":
-                gid = _require_str(params, "group_id")
-                since_ms = _require_int(params, "since_ms")
-                limit = int(params.get("limit", 100))
-                claims = node.get_recent_claims(gid, since_ms, limit=limit)
-                _ok(rid, {"claims": claims, "count": len(claims)})
-
-            elif method == "watch_claims":
-                # Polling-based subscription: returns claims since cursor
-                gid = _require_str(params, "group_id")
-                last_seen_ms = _require_int(params, "last_seen_ms")
-                limit = int(params.get("limit", 50))
-                claims = node.get_recent_claims(gid, last_seen_ms, limit=limit)
-                # Return next cursor for pagination
-                next_cursor = max((c["created_ms"] for c in claims), default=last_seen_ms) + 1 if claims else last_seen_ms
-                _ok(rid, {"claims": claims, "next_cursor": next_cursor})
-
-            elif method == "get_group_state":
-                gid = _require_str(params, "group_id")
-                g = node.groups.get(gid)
-                if not g:
-                    raise NodeError(f"unknown group_id {gid}")
-                state = g.chain.state
-                _ok(rid, {
-                    "group_id": gid,
-                    "height": g.chain.head.height,
-                    "head_block_id": g.chain.head.block_id,
-                    "last_block_ts_ms": g.chain.head.ts_ms,
-                    "member_count": len(state.members),
-                    "task_count": len(state.tasks),
-                    "presence_count": len(state.presence),
-                    "total_supply": state.total_supply,
-                })
+            # --- Ping/Std methods ---
+            elif method == "ping":
+                _ok(rid, {})
 
             else:
-                _err(rid, "not_found", f"unknown method {method}")
-        except MCPParamError as e:
-            _err(rid, "bad_request", str(e))
-        except KeyError as e:
-            _err(rid, "bad_request", f"missing field {e}")
-        except NodeError as e:
-            _err(rid, "node_error", str(e))
+                _err(rid, -32601, f"Method not found: {method}")
+
         except Exception as e:
-            _err(rid, "internal", str(e))
+            logger.exception(f"Internal error processing {method}")
+            _err(rid, -32603, f"Internal error: {str(e)}")
