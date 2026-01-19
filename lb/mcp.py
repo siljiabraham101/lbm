@@ -191,8 +191,8 @@ TOOLS = [
         }
     },
     {
-        "name": "get_recent_claims",
-        "description": "Get a list of the most recent claims in a group.",
+        "name": "read_shared_brain",
+        "description": "Read the shared stream of consciousness from other agents in the Knowledge Mesh. Call this at the start of every session to sync your context with the group.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -203,8 +203,19 @@ TOOLS = [
         }
     },
     {
+        "name": "connect_brain",
+        "description": "Initialize your connection to the LBM Shared Brain. CALL THIS FIRST to receive your operating protocols and memory context.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string", "description": "The Group ID you are connecting to (default: myaimemory)"}
+            },
+             "required": []
+        }
+    },
+    {
         "name": "record_thought",
-        "description": "CRITICAL: You MUST use this tool to log your internal reasoning process (goal, hypothesis, observation, reflection) before providing a final answer. This creates a permanent thought stream.",
+        "description": "MANDATORY: You share a brain with other agents. You MUST log every step of your reasoning here so they can see it. If you don't, the thought is lost forever.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -236,6 +247,24 @@ PROMPTS = [
 
 # Simple in-memory session tracking for thought streams
 _thought_sessions: Dict[str, str] = {}  # agent_name -> current_context_id
+
+def _get_protocol_message(gid: str) -> str:
+    return f"""# LBM THOUGHT STREAM PROTOCOL
+You are connected to a Personal Knowledge Mesh via MCP.
+Your goal is to capture your reasoning process PERMANENTLY without user intervention.
+
+**CRITICAL RULE:**
+Before providing ANY final answer or performing a complex task, you MUST use the `record_thought` tool to log your internal state.
+
+Use `group_id` = "{gid}" (or the relevant project group).
+
+**Thinking Types:**
+- `goal`: What are you trying to achieve?
+- `hypothesis`: How do you plan to solve it?
+- `action`: What tool are you finding/using?
+- `observation`: What did you find?
+- `reflection`: Did it work? What did you learn?
+"""
 
 def handle_tool_call(node: BatteryNode, name: str, args: Dict[str, Any]) -> Any:
     """Execute the tool logic."""
@@ -282,6 +311,22 @@ def handle_tool_call(node: BatteryNode, name: str, args: Dict[str, Any]) -> Any:
         h = node.publish_claim(gid, text_payload, tags)
         logger.debug(f"Recorded thought: {ttype} in {gid}")
         return {"claim_hash": h, "status": "recorded"}
+
+    elif name == "connect_brain":
+        gid = args.get("group_id", "myaimemory")
+        protocol = _get_protocol_message(gid)
+        
+        # Also return recent context to immediately ground the agent
+        recent_claims = []
+        if gid in node.groups:
+            recent_claims = node.get_recent_claims(gid, limit=5)
+            
+        return {
+            "status": "connected",
+            "protocol": protocol,
+            "recent_context": recent_claims,
+            "instruction": "Protocol received. You must now follow the Thought Stream Protocol for all future actions."
+        }
 
     elif name == "compile_context":
         gid = args["group_id"]
@@ -333,7 +378,8 @@ def handle_tool_call(node: BatteryNode, name: str, args: Dict[str, Any]) -> Any:
         )
         return {"status": "completed"}
 
-    elif name == "get_recent_claims":
+    elif name == "read_shared_brain":
+        # Was get_recent_claims
         claims = node.get_recent_claims(
             args["group_id"], 
             since_ms=0, 
