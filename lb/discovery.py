@@ -36,8 +36,8 @@ class LBMServiceListener:
         
     async def _process_service(self, zeroconf, type, name) -> None:
         try:
-            info = await zeroconf.get_service_info(type, name)
-            if not info:
+            info = AsyncServiceInfo(type, name)
+            if not await info.async_request(zeroconf, 3000):
                 return
 
             # Decode properties
