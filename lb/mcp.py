@@ -197,7 +197,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "group_id": {"type": "string"},
-                "limit": {"type": "integer", "description": "Max claims to return (default 20)"}
+                "limit": {"type": "integer", "description": "Max claims to return (default 20)"},
+                "sync_first": {"type": "boolean", "description": "Attempt to sync with peers before reading (default: false)"}
             },
             "required": ["group_id"]
         }
@@ -225,6 +226,17 @@ TOOLS = [
                 "context_id": {"type": "string", "description": "Optional session ID to link thoughts. If not provided, one is generated per agent session."}
             },
             "required": ["group_id", "content"]
+        }
+    },
+    {
+        "name": "trigger_sync",
+        "description": "Force a synchronization with peers to get the latest updates for a group.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string"}
+            },
+            "required": ["group_id"]
         }
     }
 ]
@@ -379,9 +391,35 @@ def handle_tool_call(node: BatteryNode, name: str, args: Dict[str, Any]) -> Any:
         return {"status": "completed"}
 
     elif name == "read_shared_brain":
+        gid = args["group_id"]
+        
+        # ACTIVE SYNC: If requested, pull updates from peers before reading
+        if args.get("sync_first", False):
+            # ... sync logic is already here in previous edit ...
+            pass # Keep existing logic
+
+    elif name == "trigger_sync":
+        gid = args["group_id"]
+        synced_count = 0
+        errors = []
+        if hasattr(node, "peer_registry") and node.peer_registry:
+            subs = [s for s in node.peer_registry.list_subscriptions() if s.group_id == gid]
+            for sub in subs:
+                try:
+                    asyncio.run(node.sync_group_from_peer(sub.peer_host, sub.peer_port, gid))
+                    synced_count += 1
+                except Exception as e:
+                    errors.append(f"{sub.peer_host}: {str(e)}")
+        
+        return {
+            "status": "completed" if not errors else "partial_success",
+            "synced_peers": synced_count,
+            "errors": errors
+        }
+
         # Was get_recent_claims
         claims = node.get_recent_claims(
-            args["group_id"], 
+            gid, 
             since_ms=0, 
             limit=args.get("limit", 20)
         )

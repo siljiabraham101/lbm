@@ -60,11 +60,8 @@ if [[ "$MODE" == "bg" ]]; then
     # 2. Run P2P Server
     screen -S "$SCREEN_SESSION" -X screen -t "P2P" bash -c "$LB_BIN $DATA_ARG run-p2p --host 0.0.0.0 --port $P2P_PORT; exec bash"
     
-    # 3. Run MCP Server (Optional, usually agents run it themselves, 
-    # but running a standalone one ensures it's always ready)
-    # Note: MCP usually runs over Stdio, so running it in screen is mostly for debugging
-    # or if we have a network listener mode (future). 
-    # For now, we'll just log that we are ready.
+    # 3. Run Sync Daemon
+    screen -S "$SCREEN_SESSION" -X screen -t "Sync" bash -c "$LB_BIN $DATA_ARG run-sync-daemon; exec bash"
     
     echo "✅ Started! View logs with: screen -r $SCREEN_SESSION"
     echo "   (Detach again with Ctrl+A, D)"
@@ -75,10 +72,15 @@ else
     # Run P2P in background task of this shell
     $LB_BIN $DATA_ARG run-p2p --host 0.0.0.0 --port $P2P_PORT &
     P2P_PID=$!
+
+    # Run Sync Daemon in background task
+    $LB_BIN $DATA_ARG run-sync-daemon &
+    SYNC_PID=$!
     
     echo "   P2P Server running (PID: $P2P_PID)"
+    echo "   Sync Daemon running (PID: $SYNC_PID)"
     echo "   Press Ctrl+C to stop."
     
-    # Wait for P2P
-    wait $P2P_PID
+    # Wait for processes
+    wait $P2P_PID $SYNC_PID
 fi
