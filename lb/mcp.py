@@ -128,6 +128,19 @@ TOOLS = [
         }
     },
     {
+        "name": "publish_knowledge",
+        "description": "Publish a distilled knowledge insight derived from thought streams.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string"},
+                "insight": {"type": "string", "description": "The high-level synthesized insight/knowledge"},
+                "evidence_hashes": {"type": "array", "items": {"type": "string"}, "description": "List of thought claim hashes that support this insight"}
+            },
+            "required": ["group_id", "insight"]
+        }
+    },
+    {
         "name": "compile_context",
         "description": "Retrieve relevant knowledge from the graph based on a query. Use this to answer questions using stored knowledge.",
         "inputSchema": {
@@ -254,6 +267,17 @@ PROMPTS = [
                 "required": False
             }
         ]
+    },
+    {
+        "name": "dreamer",
+        "description": "Activates Dreaming Mode: The agent will consolidate recent thought streams into permanent knowledge.",
+        "arguments": [
+            {
+                "name": "group_id",
+                "description": "The Group ID to dream about (default: myaimemory)",
+                "required": False
+            }
+        ]
     }
 ]
 
@@ -278,6 +302,20 @@ Use `group_id` = "{gid}" (or the relevant project group).
 - `reflection`: Did it work? What did you learn?
 """
 
+def _get_dreamer_message(gid: str) -> str:
+    return f"""# LBM DREAMER PROTOCOL
+You are the "Dreamer" of the Personal Knowledge Mesh.
+Your goal is to READ the recent raw thought stream and CONSOLIDATE it into high-level knowledge.
+
+**Procedure:**
+1. Call `trigger_sync(group_id="{gid}")` to ensure you have the latest thoughts.
+2. Call `read_shared_brain(group_id="{gid}", limit=50)` to get raw thoughts.
+3. Analyze the thoughts. Look for patterns, completed tasks, or key learnings.
+4. Call `publish_knowledge(group_id="{gid}", insight="...", evidence_hashes=[...])` to save the distilled wisdom.
+
+Do not ask the user for input. Just dream and consolidate.
+"""
+
 def handle_tool_call(node: BatteryNode, name: str, args: Dict[str, Any]) -> Any:
     """Execute the tool logic."""
     
@@ -293,6 +331,27 @@ def handle_tool_call(node: BatteryNode, name: str, args: Dict[str, Any]) -> Any:
             args.get("tags", []), 
             parent_hash=args.get("parent_hash")
         )
+        return {"claim_hash": h, "status": "published"}
+
+    elif name == "publish_knowledge":
+        gid = args["group_id"]
+        if gid not in node.groups:
+             raise NodeError(f"Node is not a member of group {gid}")
+             
+        insight = args["insight"]
+        evidence = args.get("evidence_hashes", [])
+        
+        # Format as structured knowledge claim
+        content = json.dumps({
+            "type": "knowledge",
+            "content": insight,
+            "evidence": evidence,
+            "ts": int(time.time() * 1000)
+        })
+        
+        tags = ["#knowledge", "#distilled"]
+        h = node.publish_claim(gid, content, tags)
+        logger.debug(f"Published knowledge in {gid}")
         return {"claim_hash": h, "status": "published"}
 
     elif name == "record_thought":
@@ -531,6 +590,16 @@ Use `group_id` = "{gid}" (or the relevant project group).
                             {
                                 "role": "user", 
                                 "content": {"type": "text", "text": sys_prompt} 
+                            }
+                        ]
+                    })
+                elif pname == "dreamer":
+                    gid = pargs.get("group_id", "myaimemory")
+                    _ok(rid, {
+                        "messages": [
+                            {
+                                "role": "user", 
+                                "content": {"type": "text", "text": _get_dreamer_message(gid)} 
                             }
                         ]
                     })
